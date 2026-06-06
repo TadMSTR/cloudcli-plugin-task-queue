@@ -226,8 +226,9 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: 'not found' }));
 
   } catch (err) {
+    process.stderr.write(`[task-queue] ${(err as Error).message}\n`);
     res.statusCode = 500;
-    res.end(JSON.stringify({ error: (err as Error).message }));
+    res.end(JSON.stringify({ error: 'internal server error' }));
   }
 });
 
