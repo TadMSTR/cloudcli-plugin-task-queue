@@ -4,14 +4,16 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { WebSocketServer, WebSocket } from 'ws';
+import { load as yamlLoad, dump as yamlDump } from 'js-yaml';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
 const HOME = process.env.HOME ?? os.homedir();
 const TASK_QUEUE_DIR = path.join(HOME, '.claude', 'task-queue');
-const TASK_QUEUE_MCP_URL = process.env.TASK_QUEUE_MCP_URL ?? 'http://localhost:8485/mcp';
 const START_TIME = Date.now();
 const VERSION = '0.1.0';
+
+const VALID_ID = /^[a-zA-Z0-9_-]+$/;
 
 // Agent-to-project mapping (matches forge task-dispatcher)
 const AGENT_PROJECTS: Record<string, string> = {
@@ -22,52 +24,70 @@ const AGENT_PROJECTS: Record<string, string> = {
   security: path.join(HOME, '.claude', 'projects', 'security'),
 };
 
-// ── JSON-RPC client for task-queue-mcp ────────────────────────────────
+// ── Task operations (direct YAML file reader) ─────────────────────────
 
-let rpcId = 0;
+interface Task {
+  task_id?: string;
+  task_type?: string;
+  target_agent?: string;
+  status?: string;
+  summary?: string;
+  created?: unknown;
+  payload?: Record<string, unknown>;
+  [key: string]: unknown;
+}
 
-async function mcpCall(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
-  const id = ++rpcId;
-  const body = JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: method, arguments: params } });
-
-  const resp = await fetch(TASK_QUEUE_MCP_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
-  });
-
-  if (!resp.ok) {
-    throw new Error(`MCP ${method} failed: HTTP ${resp.status}`);
+function readTaskFile(taskId: string): Task | null {
+  if (!VALID_ID.test(taskId)) return null;
+  const f = path.join(TASK_QUEUE_DIR, `${taskId}.yml`);
+  try {
+    const content = fs.readFileSync(f, 'utf-8');
+    return yamlLoad(content) as Task;
+  } catch {
+    return null;
   }
+}
 
-  const json = await resp.json() as { result?: { content?: Array<{ text?: string }> }; error?: { message: string } };
-  if (json.error) throw new Error(json.error.message);
-
-  // FastMCP returns tool results in content[0].text as JSON string
-  const text = json.result?.content?.[0]?.text;
-  if (text) {
-    try { return JSON.parse(text); } catch { return text; }
+function listTasks(filters: { target_agent?: string; status?: string; task_type?: string } = {}): Task[] {
+  try {
+    if (!fs.existsSync(TASK_QUEUE_DIR)) return [];
+    const files = fs.readdirSync(TASK_QUEUE_DIR).filter(f => f.endsWith('.yml') && !f.endsWith('.tmp'));
+    const tasks: Task[] = [];
+    for (const file of files) {
+      try {
+        const content = fs.readFileSync(path.join(TASK_QUEUE_DIR, file), 'utf-8');
+        const task = yamlLoad(content) as Task;
+        if (!task?.task_id) continue;
+        if (filters.target_agent && task.target_agent !== filters.target_agent) continue;
+        if (filters.status && task.status !== filters.status) continue;
+        if (filters.task_type && task.task_type !== filters.task_type) continue;
+        tasks.push(task);
+      } catch { /* skip corrupt file */ }
+    }
+    return tasks;
+  } catch {
+    return [];
   }
-  return json.result;
 }
 
-// ── Task operations ───────────────────────────────────────────────────
-
-async function listTasks(filters: { target_agent?: string; status?: string; task_type?: string } = {}): Promise<unknown[]> {
-  const params: Record<string, unknown> = { limit: 50 };
-  if (filters.target_agent) params.target_agent = filters.target_agent;
-  if (filters.status) params.status = filters.status;
-  if (filters.task_type) params.task_type = filters.task_type;
-  const result = await mcpCall('list_tasks', params);
-  return Array.isArray(result) ? result : [];
+function getTask(taskId: string): Task | null {
+  return readTaskFile(taskId);
 }
 
-async function getTask(taskId: string): Promise<unknown> {
-  return mcpCall('get_task', { task_id: taskId });
-}
-
-async function approveTask(taskId: string): Promise<unknown> {
-  return mcpCall('update_task', { task_id: taskId, status: 'approved', actor: 'operator' });
+function approveTask(taskId: string): Task | null {
+  if (!VALID_ID.test(taskId)) return null;
+  const f = path.join(TASK_QUEUE_DIR, `${taskId}.yml`);
+  try {
+    const content = fs.readFileSync(f, 'utf-8');
+    const task = yamlLoad(content) as Task;
+    task.status = 'approved';
+    const tmp = f + '.tmp';
+    fs.writeFileSync(tmp, yamlDump(task), { mode: 0o600 });
+    fs.renameSync(tmp, f);
+    return task;
+  } catch {
+    return null;
+  }
 }
 
 // ── Context ref preview ───────────────────────────────────────────────
@@ -189,20 +209,20 @@ const server = http.createServer(async (req, res) => {
       if (status) filters.status = status;
       if (taskType) filters.task_type = taskType;
 
-      const tasks = await listTasks(filters);
+      const tasks = listTasks(filters);
       res.end(JSON.stringify({ tasks }));
       return;
     }
 
     // Get task detail
-    const taskMatch = pathname.match(/^\/tasks\/([a-f0-9-]+)$/);
+    const taskMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)$/);
     if (taskMatch && req.method === 'GET') {
-      const task = await getTask(taskMatch[1]);
+      const task = getTask(taskMatch[1]);
+      if (!task) { res.statusCode = 404; res.end(JSON.stringify({ error: 'not found' })); return; }
       // Get context ref previews
       const previews: Record<string, string | null> = {};
-      const taskObj = task as { payload?: { context_refs?: string[] } };
-      if (taskObj?.payload?.context_refs) {
-        for (const ref of taskObj.payload.context_refs) {
+      if (task?.payload?.context_refs && Array.isArray(task.payload.context_refs)) {
+        for (const ref of task.payload.context_refs as string[]) {
           previews[ref] = previewFile(ref);
         }
       }
@@ -211,21 +231,23 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Start task
-    const startMatch = pathname.match(/^\/tasks\/([a-f0-9-]+)\/start$/);
+    const startMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)\/start$/);
     if (startMatch && req.method === 'POST') {
       const body = await readBody(req);
       const { mode } = JSON.parse(body) as { mode: 'review' | 'auto' };
-      const taskData = await getTask(startMatch[1]) as { target_agent: string };
-      const result = launchSession(startMatch[1], taskData.target_agent, mode ?? 'review');
+      const taskData = getTask(startMatch[1]);
+      if (!taskData) { res.statusCode = 404; res.end(JSON.stringify({ error: 'task not found' })); return; }
+      const result = launchSession(startMatch[1], taskData.target_agent ?? '', mode ?? 'review');
       res.statusCode = result.ok ? 200 : 400;
       res.end(JSON.stringify(result));
       return;
     }
 
     // Approve task
-    const approveMatch = pathname.match(/^\/tasks\/([a-f0-9-]+)\/approve$/);
+    const approveMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)\/approve$/);
     if (approveMatch && req.method === 'POST') {
-      const result = await approveTask(approveMatch[1]);
+      const result = approveTask(approveMatch[1]);
+      if (!result) { res.statusCode = 404; res.end(JSON.stringify({ error: 'task not found' })); return; }
       res.end(JSON.stringify({ ok: true, result }));
       return;
     }
@@ -266,8 +288,8 @@ server.on('upgrade', (req, socket, head) => {
   const origin = req.headers.origin ?? '';
   const allowed = [
     process.env.CLOUDCLI_ORIGIN ?? '',
-    'http://localhost:3004',
-    'http://127.0.0.1:3004',
+    'http://localhost:3001',
+    'http://127.0.0.1:3001',
   ].filter(Boolean);
 
   if (origin && !allowed.includes(origin)) {
