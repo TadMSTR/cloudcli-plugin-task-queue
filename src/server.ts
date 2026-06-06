@@ -27,7 +27,7 @@ const AGENT_PROJECTS: Record<string, string> = {
 // ── Task operations (direct YAML file reader) ─────────────────────────
 
 interface Task {
-  task_id?: string;
+  id?: string;
   task_type?: string;
   target_agent?: string;
   status?: string;
@@ -37,12 +37,21 @@ interface Task {
   [key: string]: unknown;
 }
 
-function readTaskFile(taskId: string): Task | null {
+// Files are named TIMESTAMP-<id_prefix>.yml; scan by id field value.
+function findTaskFilePath(taskId: string): string | null {
   if (!VALID_ID.test(taskId)) return null;
-  const f = path.join(TASK_QUEUE_DIR, `${taskId}.yml`);
   try {
-    const content = fs.readFileSync(f, 'utf-8');
-    return yamlLoad(content) as Task;
+    if (!fs.existsSync(TASK_QUEUE_DIR)) return null;
+    const files = fs.readdirSync(TASK_QUEUE_DIR).filter(f => f.endsWith('.yml') && !f.endsWith('.tmp'));
+    for (const file of files) {
+      try {
+        const f = path.join(TASK_QUEUE_DIR, file);
+        const content = fs.readFileSync(f, 'utf-8');
+        const task = yamlLoad(content) as Task;
+        if (task?.id === taskId) return f;
+      } catch { /* skip */ }
+    }
+    return null;
   } catch {
     return null;
   }
@@ -57,7 +66,7 @@ function listTasks(filters: { target_agent?: string; status?: string; task_type?
       try {
         const content = fs.readFileSync(path.join(TASK_QUEUE_DIR, file), 'utf-8');
         const task = yamlLoad(content) as Task;
-        if (!task?.task_id) continue;
+        if (!task?.id) continue;
         if (filters.target_agent && task.target_agent !== filters.target_agent) continue;
         if (filters.status && task.status !== filters.status) continue;
         if (filters.task_type && task.task_type !== filters.task_type) continue;
@@ -71,15 +80,20 @@ function listTasks(filters: { target_agent?: string; status?: string; task_type?
 }
 
 function getTask(taskId: string): Task | null {
-  return readTaskFile(taskId);
+  const f = findTaskFilePath(taskId);
+  if (!f) return null;
+  try {
+    return yamlLoad(fs.readFileSync(f, 'utf-8')) as Task;
+  } catch {
+    return null;
+  }
 }
 
 function approveTask(taskId: string): Task | null {
-  if (!VALID_ID.test(taskId)) return null;
-  const f = path.join(TASK_QUEUE_DIR, `${taskId}.yml`);
+  const f = findTaskFilePath(taskId);
+  if (!f) return null;
   try {
-    const content = fs.readFileSync(f, 'utf-8');
-    const task = yamlLoad(content) as Task;
+    const task = yamlLoad(fs.readFileSync(f, 'utf-8')) as Task;
     task.status = 'approved';
     const tmp = f + '.tmp';
     fs.writeFileSync(tmp, yamlDump(task), { mode: 0o600 });
