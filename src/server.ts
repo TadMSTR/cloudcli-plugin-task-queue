@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { WebSocketServer, WebSocket } from 'ws';
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -96,12 +96,14 @@ function launchSession(taskId: string, targetAgent: string, mode: 'review' | 'au
 
   const permissionMode = mode === 'review' ? 'plan' : 'default';
 
-  const child = execFile('claude', [
+  const child = spawn('claude', [
     '--project', projectDir,
     '-p', prompt,
     '--permission-mode', permissionMode,
   ], {
     cwd: projectDir,
+    stdio: 'ignore',
+    detached: true,
   });
 
   child.unref();
@@ -232,10 +234,21 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+const MAX_BODY_BYTES = 65536; // 64KB
+
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk) => chunks.push(chunk as Buffer));
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        req.destroy();
+        reject(new Error('body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks).toString()));
     req.on('error', reject);
   });
