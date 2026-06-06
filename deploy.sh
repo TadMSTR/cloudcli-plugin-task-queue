@@ -5,7 +5,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_DIR="$HOME/.claude-code-ui/plugins/cloudcli-plugin-task-queue"
-API="http://localhost:3004/api/plugins/task-queue"
+API="http://localhost:3001/api/plugins/task-queue"
 
 echo "[task-queue] Building..."
 cd "$REPO_DIR"
@@ -29,6 +29,6 @@ curl -sf -X PUT "$API/enable" -H "Content-Type: application/json" -d '{"enabled"
 sleep 2
 
 # Verify
-STATUS=$(curl -sf "$API/../" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); p=[x for x in d['plugins'] if x['name']=='task-queue']; print(f\"running={p[0]['serverRunning']}\" if p else 'not found')" 2>/dev/null)
+STATUS=$(curl -sf "http://localhost:3001/api/plugins" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); p=[x for x in d.get('plugins',[]) if x['name']=='task-queue']; print(f\"running={p[0]['serverRunning']}\" if p else 'not found')" 2>/dev/null || echo "auth required — check UI")
 echo "[task-queue] Status: $STATUS"
 echo "[task-queue] Done."
