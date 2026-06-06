@@ -1,0 +1,13 @@
+{
+  "name": "task-queue",
+  "displayName": "Task Queue",
+  "version": "0.1.0",
+  "description": "Task queue dashboard — view, filter, and launch agent tasks.",
+  "author": "TadMSTR",
+  "icon": "icon.svg",
+  "type": "module",
+  "slot": "tab",
+  "entry": "dist/index.js",
+  "server": "dist/server.js",
+  "permissions": []
+}
