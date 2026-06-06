@@ -25,7 +25,9 @@ export function createWsClient(): WsClient {
 
   function getWsUrl(): string {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${location.host}/plugin-ws/task-queue`;
+    const token = localStorage.getItem('auth-token');
+    const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+    return `${proto}//${location.host}/plugin-ws/task-queue${qs}`;
   }
 
   function emit(event: WsEvent): void {
