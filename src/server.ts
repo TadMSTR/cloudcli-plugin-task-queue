@@ -72,9 +72,16 @@ async function approveTask(taskId: string): Promise<unknown> {
 
 // ── Context ref preview ───────────────────────────────────────────────
 
+const PREVIEW_ALLOWED_PREFIXES = [
+  path.join(HOME, '.claude', 'comms'),
+  path.join(HOME, '.claude', 'task-queue'),
+];
+
 function previewFile(filePath: string, lines = 20): string | null {
+  const resolved = path.resolve(filePath);
+  if (!PREVIEW_ALLOWED_PREFIXES.some(p => resolved.startsWith(p + '/'))) return null;
   try {
-    const content = fs.readFileSync(filePath, 'utf-8');
+    const content = fs.readFileSync(resolved, 'utf-8');
     const result = content.split('\n').slice(0, lines).join('\n');
     return result;
   } catch {
