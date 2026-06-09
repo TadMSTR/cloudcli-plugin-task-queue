@@ -24,7 +24,7 @@ Live task updates arrive via WebSocket — the backend watches `~/.claude/task-q
 
 ## Installation
 
-Requires Node.js 20+ and CloudCLI running on `localhost:3004`.
+Requires Node.js 20+ and CloudCLI running on `localhost:3001`.
 
 ```bash
 cd ~/repos/personal/cloudcli-plugin-task-queue
@@ -39,7 +39,7 @@ npm install
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `TASK_QUEUE_MCP_URL` | `http://localhost:8485/mcp` | task-queue-mcp JSON-RPC endpoint |
-| `CLOUDCLI_ORIGIN` | — | Additional allowed WebSocket origin (added to `localhost:3004`) |
+| `CLOUDCLI_ORIGIN` | — | Additional allowed WebSocket origin (added to `localhost:3001`) |
 
 ## Dependencies
 
