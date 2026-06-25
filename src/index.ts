@@ -109,6 +109,55 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     }
   }
 
+  async function handleCancel(taskId: string): Promise<void> {
+    if (!confirm('Cancel this task? It becomes a terminal record — recoverable as a record, never deleted.')) return;
+    try {
+      await api.rpc('POST', `tasks/${taskId}/cancel`, { note: 'Cancelled via CloudCLI' });
+      state.error = null;
+      showToast('Task cancelled');
+      await loadTasks();
+      if (state.selectedTaskId === taskId) await loadTaskDetail(taskId);
+    } catch (err) {
+      state.error = (err as Error).message;
+      render(api.context);
+    }
+  }
+
+  async function handleQuarantine(taskId: string): Promise<void> {
+    if (!confirm('Quarantine (isolate) this task? It drops from the list but can be restored.')) return;
+    try {
+      await api.rpc('POST', `tasks/${taskId}/quarantine`, { note: 'Quarantined via CloudCLI' });
+      state.error = null;
+      showToast('Task quarantined');
+      // The task is now hidden; return to the list if we were viewing it.
+      if (state.selectedTaskId === taskId) {
+        state.selectedTaskId = null;
+        state.selectedTask = null;
+      }
+      await loadTasks();
+    } catch (err) {
+      state.error = (err as Error).message;
+      render(api.context);
+    }
+  }
+
+  async function handleSetStatus(taskId: string, status: string): Promise<void> {
+    try {
+      await api.rpc('POST', `tasks/${taskId}/status`, {
+        status,
+        note: 'Status changed via CloudCLI',
+        allow_override: true,
+      });
+      state.error = null;
+      showToast(`Status set to ${status}`);
+      await loadTasks();
+      if (state.selectedTaskId === taskId) await loadTaskDetail(taskId);
+    } catch (err) {
+      state.error = (err as Error).message;
+      render(api.context);
+    }
+  }
+
   function showToast(message: string): void {
     const toast = document.createElement('div');
     const c = themeColors(api.context.theme === 'dark');
@@ -163,6 +212,9 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
         },
         onApprove: handleApprove,
         onStart: handleStart,
+        onCancel: handleCancel,
+        onQuarantine: handleQuarantine,
+        onSetStatus: handleSetStatus,
       });
     } else {
       const listContainer = document.createElement('div');
@@ -182,6 +234,9 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
         },
         onApprove: handleApprove,
         onStart: handleStart,
+        onCancel: handleCancel,
+        onQuarantine: handleQuarantine,
+        onSetStatus: handleSetStatus,
       });
     }
   }

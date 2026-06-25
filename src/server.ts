@@ -4,7 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { WebSocketServer, WebSocket } from 'ws';
-import { load as yamlLoad, dump as yamlDump } from 'js-yaml';
+import { load as yamlLoad } from 'js-yaml';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -14,6 +14,12 @@ const START_TIME = Date.now();
 const VERSION = '0.1.0';
 
 const VALID_ID = /^[a-zA-Z0-9_-]+$/;
+
+// MCP control API — the single validated, shared-secret-gated mutation path. All
+// queue mutations (approve/cancel/status/quarantine/restore) proxy here so they
+// inherit the MCP core's transition validation + fcntl locking. Reads stay direct.
+const TASK_QUEUE_API = (process.env.TASK_QUEUE_API ?? 'http://127.0.0.1:8485').replace(/\/$/, '');
+const TASK_QUEUE_API_SECRET = process.env.TASK_QUEUE_API_SECRET ?? '';
 
 // Agent-to-project mapping (matches forge task-dispatcher)
 const AGENT_PROJECTS: Record<string, string> = {
@@ -89,18 +95,41 @@ function getTask(taskId: string): Task | null {
   }
 }
 
-function approveTask(taskId: string): Task | null {
-  const f = findTaskFilePath(taskId);
-  if (!f) return null;
+// ── MCP control API proxy (mutations) ─────────────────────────────────
+
+interface ControlApiResult {
+  status: number;
+  data: unknown;
+}
+
+// Proxy a queue mutation to the MCP control API. The shared secret is sent as a header;
+// this is the single validated write path (no direct YAML mutation in the plugin).
+async function callControlApi(
+  taskId: string,
+  action: 'approve' | 'cancel' | 'status' | 'quarantine' | 'restore',
+  body: Record<string, unknown> = {},
+): Promise<ControlApiResult> {
+  if (!VALID_ID.test(taskId)) {
+    return { status: 400, data: { ok: false, error: 'invalid task id' } };
+  }
+  if (!TASK_QUEUE_API_SECRET) {
+    return { status: 500, data: { ok: false, error: 'TASK_QUEUE_API_SECRET not configured' } };
+  }
+  const url = `${TASK_QUEUE_API}/tasks/${encodeURIComponent(taskId)}/${action}`;
   try {
-    const task = yamlLoad(fs.readFileSync(f, 'utf-8')) as Task;
-    task.status = 'approved';
-    const tmp = f + '.tmp';
-    fs.writeFileSync(tmp, yamlDump(task), { mode: 0o600 });
-    fs.renameSync(tmp, f);
-    return task;
-  } catch {
-    return null;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Task-Queue-Secret': TASK_QUEUE_API_SECRET,
+      },
+      body: JSON.stringify({ actor: 'operator', ...body }),
+    });
+    let data: unknown = {};
+    try { data = await resp.json(); } catch { data = {}; }
+    return { status: resp.status, data };
+  } catch (err) {
+    return { status: 502, data: { ok: false, error: `control API unreachable: ${(err as Error).message}` } };
   }
 }
 
@@ -299,12 +328,33 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Approve task
-    const approveMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)\/approve$/);
-    if (approveMatch && req.method === 'POST') {
-      const result = approveTask(approveMatch[1]);
-      if (!result) { res.statusCode = 404; res.end(JSON.stringify({ error: 'task not found' })); return; }
-      res.end(JSON.stringify({ ok: true, result }));
+    // Queue mutations — all proxied to the MCP control API (the single validated,
+    // shared-secret-gated write path). No direct YAML mutation happens in the plugin.
+    const mutationMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)\/(approve|cancel|status|quarantine|restore)$/);
+    if (mutationMatch && req.method === 'POST') {
+      const mTaskId = mutationMatch[1];
+      const action = mutationMatch[2] as 'approve' | 'cancel' | 'status' | 'quarantine' | 'restore';
+
+      let body: Record<string, unknown> = {};
+      // status and cancel may carry a note / target status; approve/quarantine/restore don't.
+      if (action === 'status' || action === 'cancel') {
+        const raw = await readBody(req);
+        let parsed: Record<string, unknown> = {};
+        try { parsed = raw ? JSON.parse(raw) : {}; } catch { parsed = {}; }
+        if (action === 'status') {
+          body = {
+            status: parsed.status,
+            note: parsed.note ?? '',
+            allow_override: parsed.allow_override ?? false,
+          };
+        } else if (parsed.note) {
+          body.note = parsed.note;
+        }
+      }
+
+      const { status: apiStatus, data } = await callControlApi(mTaskId, action, body);
+      res.statusCode = apiStatus;
+      res.end(JSON.stringify(data));
       return;
     }
 
