@@ -125,11 +125,32 @@ function previewFile(filePath: string, lines = 20): string | null {
 
 // ── Session launcher ──────────────────────────────────────────────────
 
+const LAUNCH_LOG_DIR = path.join(HOME, '.claude', 'comms', 'artifacts', 'task-launches');
+
+// Resolve an executable on PATH (no external deps). Returns absolute path or null.
+function resolveBin(name: string): string | null {
+  const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  for (const dir of dirs) {
+    const candidate = path.join(dir, name);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch { /* not executable here — keep looking */ }
+  }
+  return null;
+}
+
 function launchSession(taskId: string, targetAgent: string, mode: 'review' | 'auto'): { ok: boolean; error?: string } {
+  if (!VALID_ID.test(taskId)) return { ok: false, error: `Invalid task id: ${taskId}` };
+
   const projectDir = AGENT_PROJECTS[targetAgent];
   if (!projectDir) return { ok: false, error: `Unknown agent: ${targetAgent}` };
 
   if (!fs.existsSync(projectDir)) return { ok: false, error: `Project dir missing: ${projectDir}` };
+
+  // Resolve the binary up front so a missing CLI is a clean 400, not a silent exit.
+  const claudeBin = resolveBin('claude');
+  if (!claudeBin) return { ok: false, error: 'claude CLI not found on PATH' };
 
   const prompt = mode === 'review'
     ? `You have a pending task (id=${taskId}). Read it from task-queue-mcp via get_task. Present a summary of the work entailed. Do NOT begin execution — wait for operator approval.`
@@ -137,19 +158,40 @@ function launchSession(taskId: string, targetAgent: string, mode: 'review' | 'au
 
   const permissionMode = mode === 'review' ? 'plan' : 'default';
 
-  const child = spawn('claude', [
-    '--project', projectDir,
-    '-p', prompt,
-    '--permission-mode', permissionMode,
-  ], {
-    cwd: projectDir,
-    stdio: 'ignore',
-    detached: true,
-  });
+  // Per-launch log replaces stdio:'ignore' so a failed launch is diagnosable.
+  // cwd:projectDir is how Claude Code resolves project config — `--project` is not a valid flag.
+  let logFd: number;
+  let logPath: string;
+  try {
+    fs.mkdirSync(LAUNCH_LOG_DIR, { recursive: true });
+    logPath = path.join(LAUNCH_LOG_DIR, `${taskId}.log`);
+    logFd = fs.openSync(logPath, 'a');
+  } catch (err) {
+    return { ok: false, error: `Cannot open launch log: ${(err as Error).message}` };
+  }
 
-  child.unref();
+  try {
+    const child = spawn(claudeBin, [
+      '-p', prompt,
+      '--permission-mode', permissionMode,
+    ], {
+      cwd: projectDir,
+      stdio: ['ignore', logFd, logFd],
+      detached: true,
+    });
 
-  return { ok: true };
+    child.on('error', (err) => {
+      try { fs.appendFileSync(logPath, `[launch error] ${err.message}\n`); } catch { /* best-effort */ }
+    });
+
+    child.unref();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: `spawn failed: ${(err as Error).message}` };
+  } finally {
+    // The child inherited its own dup of the fd; close our copy.
+    try { fs.closeSync(logFd); } catch { /* already gone */ }
+  }
 }
 
 // ── File watcher ──────────────────────────────────────────────────────
