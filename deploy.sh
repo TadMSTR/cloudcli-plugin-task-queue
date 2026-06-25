@@ -7,13 +7,24 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_DIR="$HOME/.claude-code-ui/plugins/cloudcli-plugin-task-queue"
 API="http://localhost:3001/api/plugins/task-queue"
 
+# Load CLOUDCLI_API_KEY from forge secrets
+FORGE_ENV="$HOME/.secrets/forge.env"
+if [ -f "$FORGE_ENV" ]; then
+  set -a; source "$FORGE_ENV"; set +a
+fi
+if [ -z "${CLOUDCLI_API_KEY:-}" ]; then
+  echo "[task-queue] ERROR: CLOUDCLI_API_KEY not set — add it to ~/.secrets/forge.env" >&2
+  exit 1
+fi
+AUTH_HEADER="X-API-Key: $CLOUDCLI_API_KEY"
+
 echo "[task-queue] Building..."
 cd "$REPO_DIR"
 npm run build
 
 echo "[task-queue] Deploying to $PLUGIN_DIR..."
 # Disable plugin to stop the server
-curl -sf -X PUT "$API/enable" -H "Content-Type: application/json" -d '{"enabled":false}' > /dev/null 2>&1 || true
+curl -sf -X PUT "$API/enable" -H "Content-Type: application/json" -H "$AUTH_HEADER" -d '{"enabled":false}' > /dev/null 2>&1 || true
 sleep 1
 
 rm -rf "$PLUGIN_DIR"
@@ -25,10 +36,10 @@ if [ -d "$REPO_DIR/node_modules" ]; then
 fi
 
 # Re-enable to start the server
-curl -sf -X PUT "$API/enable" -H "Content-Type: application/json" -d '{"enabled":true}' > /dev/null 2>&1
+curl -sf -X PUT "$API/enable" -H "Content-Type: application/json" -H "$AUTH_HEADER" -d '{"enabled":true}' > /dev/null 2>&1
 sleep 2
 
 # Verify
-STATUS=$(curl -sf "http://localhost:3001/api/plugins" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); p=[x for x in d.get('plugins',[]) if x['name']=='task-queue']; print(f\"running={p[0]['serverRunning']}\" if p else 'not found')" 2>/dev/null || echo "auth required — check UI")
+STATUS=$(curl -sf "http://localhost:3001/api/plugins" -H "$AUTH_HEADER" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); p=[x for x in d.get('plugins',[]) if x['name']=='task-queue']; print(f\"running={p[0]['serverRunning']}\" if p else 'not found')" 2>/dev/null || echo "verify failed — check CloudCLI")
 echo "[task-queue] Status: $STATUS"
 echo "[task-queue] Done."
