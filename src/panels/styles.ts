@@ -69,6 +69,7 @@ export function statusColor(status: string, c: ThemeColors): string {
     case 'pending-approval': return c.warn;
     case 'completed': return c.ok;
     case 'failed': return c.error;
+    case 'cancelled': return c.muted;
     default: return c.muted;
   }
 }

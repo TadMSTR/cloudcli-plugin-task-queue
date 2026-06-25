@@ -7,6 +7,9 @@ interface TaskListOptions {
   onSelect: (taskId: string) => void;
   onApprove: (taskId: string) => void;
   onStart: (taskId: string, mode: 'review' | 'auto') => void;
+  onCancel: (taskId: string) => void;
+  onQuarantine: (taskId: string) => void;
+  onSetStatus: (taskId: string, status: string) => void;
   filters: { agent: string; status: string; taskType: string };
   onFilterChange: (filters: { agent: string; status: string; taskType: string }) => void;
 }
@@ -18,7 +21,14 @@ const STATUS_ORDER: Record<string, number> = {
   'submitted': 3,
   'completed': 4,
   'failed': 5,
+  'cancelled': 6,
 };
+
+// Non-terminal statuses an operator can move a task between (the status-change control).
+const NON_TERMINAL_STATUSES = ['submitted', 'pending-approval', 'approved', 'in-progress'];
+const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
+
+export { NON_TERMINAL_STATUSES, TERMINAL_STATUSES };
 
 const PRIORITY_ORDER: Record<string, number> = {
   'urgent': 0,
@@ -49,7 +59,7 @@ function groupByAgent(tasks: Task[]): Map<string, Task[]> {
 }
 
 export function renderTaskList(container: HTMLElement, opts: TaskListOptions): void {
-  const { tasks, colors: c, filters, onFilterChange, onSelect, onApprove, onStart } = opts;
+  const { tasks, colors: c, filters, onFilterChange, onSelect, onApprove, onStart, onCancel, onQuarantine } = opts;
 
   // Collect unique values for filters
   const agents = [...new Set(tasks.map(t => t.target_agent))].sort();
@@ -168,6 +178,12 @@ export function renderTaskList(container: HTMLElement, opts: TaskListOptions): v
         const approveBtn = makeButton('Approve', c.ok, c, () => onApprove(task.id));
         actions.appendChild(approveBtn);
       }
+
+      // Lifecycle controls: cancel any non-terminal task; quarantine (isolate) any task.
+      if (!TERMINAL_STATUSES.includes(task.status)) {
+        actions.appendChild(makeButton('Cancel', c.error, c, () => onCancel(task.id)));
+      }
+      actions.appendChild(makeButton('Quarantine', c.muted, c, () => onQuarantine(task.id)));
 
       row.appendChild(actions);
       group.appendChild(row);

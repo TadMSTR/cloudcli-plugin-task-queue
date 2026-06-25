@@ -8,10 +8,16 @@ interface TaskDetailOptions {
   onBack: () => void;
   onApprove: (taskId: string) => void;
   onStart: (taskId: string, mode: 'review' | 'auto') => void;
+  onCancel: (taskId: string) => void;
+  onQuarantine: (taskId: string) => void;
+  onSetStatus: (taskId: string, status: string) => void;
 }
 
+const DETAIL_TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
+const DETAIL_NON_TERMINAL_STATUSES = ['submitted', 'pending-approval', 'approved', 'in-progress'];
+
 export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions): void {
-  const { task, contextPreviews, colors: c, onBack, onApprove, onStart } = opts;
+  const { task, contextPreviews, colors: c, onBack, onApprove, onStart, onCancel, onQuarantine, onSetStatus } = opts;
 
   const sc = statusColor(task.status, c);
   const priority = task.payload.priority ?? 'normal';
@@ -70,7 +76,43 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
   if (task.status === 'pending-approval' || task.status === 'submitted') {
     actions.appendChild(makeActionButton('Approve', c.ok, c, () => onApprove(task.id)));
   }
+  // Lifecycle controls: cancel any non-terminal task; quarantine (isolate) any task.
+  if (!DETAIL_TERMINAL_STATUSES.includes(task.status)) {
+    actions.appendChild(makeActionButton('Cancel', c.error, c, () => onCancel(task.id)));
+  }
+  actions.appendChild(makeActionButton('Quarantine', c.muted, c, () => onQuarantine(task.id)));
   if (actions.childElementCount > 0) wrapper.appendChild(actions);
+
+  // Status-change control — advance a task an agent missed (audited operator override).
+  if (!DETAIL_TERMINAL_STATUSES.includes(task.status)) {
+    const statusRow = document.createElement('div');
+    statusRow.style.cssText = `display:flex;align-items:center;gap:8px;margin-bottom:16px;`;
+
+    const label = document.createElement('span');
+    label.style.cssText = `color:${c.muted};font-size:12px`;
+    label.textContent = 'Set status';
+
+    const select = document.createElement('select');
+    select.style.cssText = `background:${c.surface};color:${c.text};border:1px solid ${c.border};border-radius:4px;padding:4px 8px;font-family:${MONO};font-size:12px;`;
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = 'advance to…';
+    select.appendChild(placeholder);
+    for (const s of DETAIL_NON_TERMINAL_STATUSES) {
+      if (s === task.status) continue;
+      const opt = document.createElement('option');
+      opt.value = s;
+      opt.textContent = s;
+      select.appendChild(opt);
+    }
+    select.addEventListener('change', () => {
+      if (select.value) onSetStatus(task.id, select.value);
+    });
+
+    statusRow.appendChild(label);
+    statusRow.appendChild(select);
+    wrapper.appendChild(statusRow);
+  }
 
   // Description
   if (task.payload.description) {

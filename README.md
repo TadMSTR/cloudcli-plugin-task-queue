@@ -7,7 +7,7 @@ CloudCLI tab plugin for task queue management on forge. Provides a browser UI in
 The plugin runs two components:
 
 - **UI** (`dist/index.js`) — Renders a tab panel inside CloudCLI. Shows a filterable task list and detail view with history timeline and context ref previews.
-- **Backend server** (`dist/server.js`) — HTTP + WebSocket server launched by CloudCLI. Proxies task-queue-mcp at `localhost:8485` and watches `~/.claude/task-queue/` for file changes.
+- **Backend server** (`dist/server.js`) — HTTP + WebSocket server launched by CloudCLI. **Reads** task YAML directly from `~/.claude/task-queue/` (list/detail) and watches it for file changes. **Mutations** (approve, cancel, status change, quarantine, restore) are proxied to the `task-queue-mcp` **HTTP control API** (`TASK_QUEUE_API`, default `http://127.0.0.1:8485`), gated by a shared-secret header — so every write inherits the MCP core's transition validation and `fcntl` locking. The plugin no longer writes queue YAML directly.
 
 The backend picks a free ephemeral port at startup and reports it to CloudCLI via JSON on stdout. The UI communicates with the backend via the CloudCLI plugin RPC API (`api.rpc()`), which proxies requests to the backend.
 
@@ -18,7 +18,11 @@ Live task updates arrive via WebSocket — the backend watches `~/.claude/task-q
 - Task list with filters by agent, status, and task type
 - Detail view: full task data, history timeline, context ref file previews (confined to `~/.claude/comms/` and `~/.claude/task-queue/`)
 - Session launch: **review mode** (plan permission, agent presents summary then waits) or **auto mode** (agent claims and executes)
-- Task approval (sets status to `approved`, actor `operator`)
+- Lifecycle actions (all via the shared-secret control API, actor `operator`):
+  - **Approve** a submitted / pending task
+  - **Cancel** a non-terminal task — a graceful terminal record (recoverable as a record, never deleted) instead of mislabeling it `failed`
+  - **Quarantine / restore** — isolate a task to `quarantine/` (drops from the list) and restore it later
+  - **Status change** — advance a task an agent missed (audited operator override)
 - Live connection indicator (WebSocket dot: green = live, grey = disconnected)
 - Manual refresh button
 
@@ -38,7 +42,8 @@ npm install
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `TASK_QUEUE_MCP_URL` | `http://localhost:8485/mcp` | task-queue-mcp JSON-RPC endpoint |
+| `TASK_QUEUE_API` | `http://127.0.0.1:8485` | Base URL of the task-queue-mcp HTTP control API (mutations) |
+| `TASK_QUEUE_API_SECRET` | — | Shared secret sent as `X-Task-Queue-Secret` on every mutation. **Required** — mutations fail closed if unset. Provisioned in `~/.secrets/forge.env`, never in source. |
 | `CLOUDCLI_ORIGIN` | — | Additional allowed WebSocket origin (added to `localhost:3001`) |
 
 ## Dependencies
@@ -66,8 +71,14 @@ The backend server exposes a small HTTP API consumed by the UI via `api.rpc()`.
 | `GET` | `/health` | Liveness check; returns `{status, uptime, version}` |
 | `GET` | `/tasks` | List tasks; query params: `agent`, `status`, `type` |
 | `GET` | `/tasks/:id` | Task detail + context ref previews |
-| `POST` | `/tasks/:id/start` | Launch headless agent session; body `{mode: "review"\|"auto"}` |
-| `POST` | `/tasks/:id/approve` | Approve task via task-queue-mcp |
+| `POST` | `/tasks/:id/start` | Launch headless agent session; body `{mode: "review"\|"auto"}` (client-side spawn, not a queue mutation) |
+| `POST` | `/tasks/:id/approve` | Approve — proxied to the control API |
+| `POST` | `/tasks/:id/cancel` | Cancel (terminal); body `{note?}` — proxied to the control API |
+| `POST` | `/tasks/:id/status` | Operator status change; body `{status, note?, allow_override?}` — proxied to the control API |
+| `POST` | `/tasks/:id/quarantine` | Isolate to `quarantine/` — proxied to the control API |
+| `POST` | `/tasks/:id/restore` | Restore from `quarantine/` — proxied to the control API |
+
+Reads (`/tasks`, `/tasks/:id`) are served directly from the queue YAML. Mutations proxy to the `task-queue-mcp` control API with the `X-Task-Queue-Secret` header.
 
 WebSocket upgrade is handled on the same port. Clients receive `{type: "connected"}` on connect and `{type: "tasks", count, changed}` when task files change.
 
