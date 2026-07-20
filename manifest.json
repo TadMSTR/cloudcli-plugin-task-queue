@@ -9,5 +9,5 @@
   "slot": "tab",
   "entry": "dist/index.js",
   "server": "dist/server.js",
-  "permissions": []
+  "permissions": ["env:TASK_QUEUE_API", "env:TASK_QUEUE_API_SECRET"]
 }

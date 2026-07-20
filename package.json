@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "npx tsc --noEmit && npx esbuild src/index.ts --bundle --format=esm --outfile=dist/index.js --sourcemap && npx esbuild src/server.ts --bundle --format=esm --platform=node --outfile=dist/server.js --sourcemap --external:ws"
+    "build": "npx tsc --noEmit && npx esbuild src/index.ts --bundle --format=esm --outfile=dist/index.js --sourcemap && npx esbuild src/server.ts --bundle --format=esm --platform=node --outfile=dist/server.js --sourcemap --external:ws",
+    "test": "node --test src/tests/*.test.ts"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
