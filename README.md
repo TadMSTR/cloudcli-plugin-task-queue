@@ -46,6 +46,20 @@ npm install
 | `TASK_QUEUE_API_SECRET` | — | Shared secret sent as `X-Task-Queue-Secret` on every mutation. **Required** — mutations fail closed if unset. Provisioned in `~/.secrets/forge.env`, never in source. |
 | `CLOUDCLI_ORIGIN` | — | Additional allowed WebSocket origin (added to `localhost:3001`) |
 
+### How the plugin subprocess receives its env vars
+
+CloudCLI launches the backend server (`dist/server.js`) as a subprocess and, by default,
+strips host environment variables from it — including secrets. This plugin's process only
+sees `TASK_QUEUE_API` / `TASK_QUEUE_API_SECRET` because `manifest.json` declares
+`permissions: ["env:TASK_QUEUE_API", "env:TASK_QUEUE_API_SECRET"]`, and CloudCLI passes a
+host env var through to a plugin subprocess only when **both** are true: the manifest
+declares `env:<VAR>` **and** that var is on CloudCLI's host-side `PLUGIN_ENV_ALLOWLIST`.
+Requires a CloudCLI build with this permission-gated env passthrough — without it, the
+launcher silently strips the secret and every control-API mutation fails closed (this broke
+undetected for three weeks starting 2026-06-25; see `CHANGELOG.md` [0.2.0]). Failures in the
+control-API call path (missing secret, unreachable transport) log to
+`~/.pm2/logs/cloudcli-error.log`, never the secret value.
+
 ## Dependencies
 
 | Package | Purpose |
