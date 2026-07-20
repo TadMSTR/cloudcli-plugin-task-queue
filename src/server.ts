@@ -5,13 +5,14 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { WebSocketServer, WebSocket } from 'ws';
 import { load as yamlLoad } from 'js-yaml';
+import { callControlApi, type ControlAction } from './control-api.ts';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
 const HOME = process.env.HOME ?? os.homedir();
 const TASK_QUEUE_DIR = path.join(HOME, '.claude', 'task-queue');
 const START_TIME = Date.now();
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 const VALID_ID = /^[a-zA-Z0-9_-]+$/;
 
@@ -92,44 +93,6 @@ function getTask(taskId: string): Task | null {
     return yamlLoad(fs.readFileSync(f, 'utf-8')) as Task;
   } catch {
     return null;
-  }
-}
-
-// ── MCP control API proxy (mutations) ─────────────────────────────────
-
-interface ControlApiResult {
-  status: number;
-  data: unknown;
-}
-
-// Proxy a queue mutation to the MCP control API. The shared secret is sent as a header;
-// this is the single validated write path (no direct YAML mutation in the plugin).
-async function callControlApi(
-  taskId: string,
-  action: 'approve' | 'cancel' | 'status' | 'quarantine' | 'restore',
-  body: Record<string, unknown> = {},
-): Promise<ControlApiResult> {
-  if (!VALID_ID.test(taskId)) {
-    return { status: 400, data: { ok: false, error: 'invalid task id' } };
-  }
-  if (!TASK_QUEUE_API_SECRET) {
-    return { status: 500, data: { ok: false, error: 'TASK_QUEUE_API_SECRET not configured' } };
-  }
-  const url = `${TASK_QUEUE_API}/tasks/${encodeURIComponent(taskId)}/${action}`;
-  try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Task-Queue-Secret': TASK_QUEUE_API_SECRET,
-      },
-      body: JSON.stringify({ actor: 'operator', ...body }),
-    });
-    let data: unknown = {};
-    try { data = await resp.json(); } catch { data = {}; }
-    return { status: resp.status, data };
-  } catch (err) {
-    return { status: 502, data: { ok: false, error: `control API unreachable: ${(err as Error).message}` } };
   }
 }
 
@@ -333,7 +296,7 @@ const server = http.createServer(async (req, res) => {
     const mutationMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)\/(approve|cancel|status|quarantine|restore)$/);
     if (mutationMatch && req.method === 'POST') {
       const mTaskId = mutationMatch[1];
-      const action = mutationMatch[2] as 'approve' | 'cancel' | 'status' | 'quarantine' | 'restore';
+      const action = mutationMatch[2] as ControlAction;
 
       let body: Record<string, unknown> = {};
       // status and cancel may carry a note / target status; approve/quarantine/restore don't.
@@ -352,7 +315,10 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      const { status: apiStatus, data } = await callControlApi(mTaskId, action, body);
+      const { status: apiStatus, data } = await callControlApi(mTaskId, action, body, {
+        apiBase: TASK_QUEUE_API,
+        secret: TASK_QUEUE_API_SECRET,
+      });
       res.statusCode = apiStatus;
       res.end(JSON.stringify(data));
       return;
