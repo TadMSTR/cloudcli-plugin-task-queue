@@ -12,7 +12,7 @@ import { callControlApi, type ControlAction } from './control-api.ts';
 const HOME = process.env.HOME ?? os.homedir();
 const TASK_QUEUE_DIR = path.join(HOME, '.claude', 'task-queue');
 const START_TIME = Date.now();
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 const VALID_ID = /^[a-zA-Z0-9_-]+$/;
 

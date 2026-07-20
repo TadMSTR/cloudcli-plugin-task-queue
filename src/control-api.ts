@@ -70,6 +70,10 @@ export async function callControlApi(
     console.error(
       `[task-queue] control API ${action} on task ${taskId} unreachable at ${url}: ${(err as Error).message}`,
     );
+    // SECURITY[accepted]: err.message (a Node fetch connection error, e.g. ECONNREFUSED —
+    // not a stack trace or internal path) is surfaced to the CloudCLI UI. Client is Ted's
+    // authenticated, loopback-bound operator UI; matches the accepted OE-02 precedent from
+    // cloudcli-plugin-plane. Genericize if this endpoint is ever exposed beyond loopback.
     return { status: 502, data: { ok: false, error: `control API unreachable: ${(err as Error).message}` } };
   }
 }
