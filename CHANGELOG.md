@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-07-23
+
+### Changed
+- Repalette to follow CloudCLI's own theme. `themeColors()` now reads CloudCLI's
+  CSS custom properties live off the shared document root — `--primary` (accent),
+  `--background`, `--card` (surface), `--border`, `--foreground` (text),
+  `--muted-foreground` (muted) — instead of the previous hardcoded amber palette.
+  The accent is now CloudCLI blue, and the plugin auto-follows any future CloudCLI
+  palette change (including light/dark toggle, already re-driven via
+  `api.onContextChange`). Per-theme hardcoded fallbacks are used only when a var is
+  missing; the `dark` param now just selects the fallback set.
+- Status colors (`ok`/`warn`/`error`) stay hardcoded green/amber/red — CloudCLI has
+  no semantic status vars and its dark `--destructive` is too low-contrast for text.
+
 ## [0.2.0] - 2026-07-20
 
 ### Fixed
