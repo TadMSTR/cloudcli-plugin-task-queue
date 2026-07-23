@@ -8,32 +8,65 @@ export function escHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// Read a CSS custom property off CloudCLI's shared document root. The plugin renders
+// inside CloudCLI's DOM, so its theme vars are in scope. Returns '' if unset/unavailable.
+function rawVar(name: string): string {
+  try {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  } catch {
+    return '';
+  }
+}
+
+// CloudCLI stores colors as bare HSL triplets ("221.2 83.2% 53.3%"), so wrap in hsl().
+function hslVar(name: string, fallback: string): string {
+  const v = rawVar(name);
+  return v ? `hsl(${v})` : fallback;
+}
+
+// Follow CloudCLI's palette by reading its CSS vars live. CloudCLI toggles the `.dark`
+// class on the same root and re-drives these vars, and the plugin re-invokes themeColors
+// on api.onContextChange — so reading the vars auto-reflects the active theme. The `dark`
+// param only selects which hardcoded fallback set to use when a var is missing.
 export function themeColors(dark: boolean): ThemeColors {
-  return dark
+  const fb = dark
     ? {
-        bg: '#08080f',
-        surface: '#0e0e1a',
-        border: '#1a1a2c',
-        text: '#e2e0f0',
-        muted: '#52507a',
-        accent: '#fbbf24',
-        dim: 'rgba(251,191,36,0.1)',
-        ok: '#22c55e',
-        warn: '#f59e0b',
-        error: '#ef4444',
+        bg: '#141414',
+        surface: '#1F1F1F',
+        border: '#2B2B2B',
+        text: '#EEECEA',
+        muted: '#999999',
+        accent: '#3B82F6',
+        dim: 'rgba(59,130,246,0.12)',
       }
     : {
-        bg: '#fafaf9',
-        surface: '#ffffff',
-        border: '#e8e6f0',
-        text: '#0f0e1a',
-        muted: '#9490b0',
-        accent: '#d97706',
-        dim: 'rgba(217,119,6,0.08)',
-        ok: '#16a34a',
-        warn: '#d97706',
-        error: '#dc2626',
+        bg: '#F7F4EF',
+        surface: '#FFFFFF',
+        border: '#E2DDD3',
+        text: '#0D0A07',
+        muted: '#767066',
+        accent: '#2563EB',
+        dim: 'rgba(37,99,235,0.10)',
       };
+
+  const primaryRaw = rawVar('--primary');
+  const dim = primaryRaw ? `hsl(${primaryRaw} / 0.12)` : fb.dim;
+
+  return {
+    bg: hslVar('--background', fb.bg),
+    surface: hslVar('--card', fb.surface),
+    border: hslVar('--border', fb.border),
+    text: hslVar('--foreground', fb.text),
+    muted: hslVar('--muted-foreground', fb.muted),
+    accent: hslVar('--primary', fb.accent),
+    dim,
+    // Status colors stay hardcoded: CloudCLI has no semantic status vars, and its dark
+    // --destructive (#7f1d1d) is too low-contrast for status text. Green/amber/red below
+    // match CloudCLI's component conventions while staying legible.
+    ok: dark ? '#22c55e' : '#16a34a',
+    warn: dark ? '#f59e0b' : '#d97706',
+    error: dark ? '#ef4444' : '#dc2626',
+  };
 }
 
 export function injectGlobalStyles(): void {
