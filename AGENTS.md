@@ -49,7 +49,10 @@ npm test
 
 Tests cover `control-api.ts`: the secret gate, task-id validation, header and body shape per action, transport-failure mapping, and pass-through of the MCP's authorization rejections. The UI panels are not unit-tested — verify them in CloudCLI after `./deploy.sh && pm2 restart cloudcli`.
 
-Note `npm run build` invokes `tsc`/`esbuild` from `node_modules/.bin`, not via bare `npx`. `npx tsc` will silently download an unrelated registry package named `tsc` if devDependencies are not installed.
+Two build/test gotchas worth knowing before you touch either script:
+
+- **`npm test` needs Node 22.18+.** `node --test` runs the `.ts` test files directly, relying on Node's built-in type stripping. On Node 20 every test fails with `ERR_UNKNOWN_FILE_EXTENSION`. The plugin's *runtime* requirement is still Node 20+ — `dist/` is bundled plain JS — so the README's stated minimum and CI's Node version differ on purpose.
+- **`npm run build` invokes `tsc`/`esbuild` from `node_modules/.bin`, not via bare `npx`.** `npx tsc` silently downloads an unrelated registry package named `tsc` when devDependencies are missing, replacing the typecheck gate with a stranger's binary. Do not "simplify" it back to `npx`.
 
 ## Git workflow
 

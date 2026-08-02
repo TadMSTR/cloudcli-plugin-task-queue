@@ -129,10 +129,12 @@ A task whose `target_agent` is absent from the map returns a clean `Unknown agen
 ```bash
 npm install
 npm run build   # tsc --noEmit (typecheck) + esbuild bundle to dist/
-npm test        # node --test
+npm test        # node --test — requires Node 22.18+
 ```
 
 `npm run build` is the typecheck gate — `tsc --noEmit` runs first and the bundle only happens if it passes.
+
+The test runner executes the `.ts` files directly using Node's built-in type stripping, so **`npm test` needs Node 22.18+** even though the plugin itself runs on Node 20+ (`dist/` is bundled plain JS).
 
 ## License
 

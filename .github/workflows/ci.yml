@@ -16,7 +16,11 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
-          node-version: "20"
+          # 22, not 20: `npm test` runs `node --test` directly against .ts sources, which
+          # needs Node's built-in type stripping (unflagged from 22.18). On Node 20 every
+          # test fails with ERR_UNKNOWN_FILE_EXTENSION. The plugin's *runtime* requirement
+          # is still Node 20+ — dist/ is bundled plain JS.
+          node-version: "22"
           cache: npm
 
       - name: Install dependencies

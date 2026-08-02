@@ -22,7 +22,11 @@ park, unpark, and amend routes do not exist on earlier versions.
 - The history timeline now labels non-status actions (`amend`) by action rather than
   repeating the task's status, which read as a redundant transition.
 - `AGENTS.md`, `LICENSE` (MIT), `.github/workflows/ci.yml` and `release.yml`, and README
-  badges — bringing the repo to Baseline standard.
+  badges — bringing the repo to Baseline standard. CI pins Node 22, not 20: `npm test`
+  runs `node --test` against the `.ts` sources and depends on Node's built-in type
+  stripping, so on Node 20 every test fails with `ERR_UNKNOWN_FILE_EXTENSION`. The repo
+  had no CI before, so this was never exercised on a clean interpreter. The plugin's
+  runtime requirement is unchanged at Node 20+ — `dist/` is bundled plain JS.
 
 ### Changed
 - README rewritten for a public audience. It now says what the plugin *is* — a UI for
