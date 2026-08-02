@@ -39,6 +39,21 @@ export interface TaskHistoryEntry {
   status: string;
   actor: string;
   note: string;
+  /** Present on non-status actions, e.g. 'amend'. */
+  action?: string;
+  /** Set when the transition used the operator override path. */
+  override?: boolean;
+}
+
+/**
+ * An append-only correction to a queued task. The task's original
+ * `payload.description` is never rewritten — amendments are rendered after it.
+ */
+export interface TaskAmendment {
+  timestamp: string;
+  actor: string;
+  reason?: string;
+  text: string;
 }
 
 export interface Task {
@@ -52,10 +67,13 @@ export interface Task {
   status: string;
   summary: string;
   ttl_days: number;
+  /** Status to return to on unpark. Present only while status === 'parked'. */
+  parked_from?: string;
   payload: {
     description: string;
     context_refs?: string[];
     priority?: string;
+    amendments?: TaskAmendment[];
   };
   result: {
     output: string | null;

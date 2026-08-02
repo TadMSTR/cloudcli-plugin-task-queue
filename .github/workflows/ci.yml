@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "feat/**", "feature/**", "fix/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `npm run build` runs `tsc --noEmit` before bundling, so this is the
+      # typecheck gate as well as the build.
+      - name: Build (typecheck + bundle)
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      # Production dependencies only. The dev tree carries advisories that do not
+      # apply to a plugin bundled at build time and never served by a dev server.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
