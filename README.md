@@ -1,129 +1,141 @@
 # cloudcli-plugin-task-queue
 
-CloudCLI tab plugin for task queue management on forge. Provides a browser UI inside the CloudCLI web interface to view, filter, and act on agent tasks without leaving the editor.
+[![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-6B57FF?logo=claude&logoColor=white)](https://claude.ai/code)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Overview
+A CloudCLI tab plugin that gives [task-queue-mcp](https://github.com/TadMSTR/task-queue-mcp) a browser UI. View, filter, and act on agent tasks — approve, park, amend, cancel, and launch a session — without leaving the editor.
 
-The plugin runs two components:
+**This plugin is a front end. It does nothing on its own**: `task-queue-mcp` owns the queue, and every mutation this plugin makes is proxied to that server's control API.
 
-- **UI** (`dist/index.js`) — Renders a tab panel inside CloudCLI. Shows a filterable task list and detail view with history timeline and context ref previews.
-- **Backend server** (`dist/server.js`) — HTTP + WebSocket server launched by CloudCLI. **Reads** task YAML directly from `~/.claude/task-queue/` (list/detail) and watches it for file changes. **Mutations** (approve, cancel, status change, quarantine, restore) are proxied to the `task-queue-mcp` **HTTP control API** (`TASK_QUEUE_API`, default `http://127.0.0.1:8485`), gated by a shared-secret header — so every write inherits the MCP core's transition validation and `fcntl` locking. The plugin no longer writes queue YAML directly.
+## Requirements
 
-The backend picks a free ephemeral port at startup and reports it to CloudCLI via JSON on stdout. The UI communicates with the backend via the CloudCLI plugin RPC API (`api.rpc()`), which proxies requests to the backend.
+- **[task-queue-mcp](https://github.com/TadMSTR/task-queue-mcp)** — the queue backend. This plugin is a UI for it and does nothing without it.
+- **CloudCLI** ([claudecodeui](https://github.com/siteboon/claudecodeui)) with permission-gated plugin env passthrough — see [How the plugin receives its env vars](#how-the-plugin-receives-its-env-vars).
+- **Node.js 20+**
 
-Live task updates arrive via WebSocket — the backend watches `~/.claude/task-queue/*.yml` and pushes a `tasks` event to connected UI clients when files change. The UI debounces refreshes by 2s.
+## Architecture
+
+Four moving parts. The asymmetry is the important bit: **reads go direct to the queue files, writes always go through the MCP server.**
+
+```mermaid
+flowchart LR
+  UI["Plugin UI<br/>dist/index.js"] -->|api.rpc| BE["Plugin backend<br/>dist/server.js"]
+  BE -->|"read: YAML"| Q[("Task queue<br/>*.yml")]
+  BE -->|"write: POST + X-Task-Queue-Secret"| MCP["task-queue-mcp<br/>control API :8485"]
+  MCP -->|validated write| Q
+  BE -.->|"WebSocket: file-change events"| UI
+```
+
+Reading directly keeps the list fast and lets the backend watch the directory for live updates. Routing every write through `task-queue-mcp` means mutations inherit its transition validation, `fcntl` locking, and atomic writes, so the plugin can never leave a task in a state the queue's own rules forbid. **The plugin never writes queue YAML directly.**
+
+- **UI** (`dist/index.js`) — renders the tab panel: a filterable task list and a detail view with history timeline, amendments, and context-ref previews.
+- **Backend** (`dist/server.js`) — HTTP + WebSocket server launched by CloudCLI. Picks a free ephemeral port at startup and reports it to CloudCLI as JSON on stdout. The UI reaches it through CloudCLI's plugin RPC API (`api.rpc()`).
+
+Live updates arrive over WebSocket: the backend watches the queue directory and pushes a `tasks` event when files change; the UI debounces refreshes by 2s.
 
 ## Features
 
-- Task list with filters by agent, status, and task type
-- Detail view: full task data, history timeline, context ref file previews (confined to `~/.claude/comms/` and `~/.claude/task-queue/`)
-- Session launch: **review mode** (plan permission, agent presents summary then waits) or **auto mode** (agent claims and executes)
-- Lifecycle actions (all via the shared-secret control API, actor `operator`):
-  - **Approve** a submitted / pending task
-  - **Cancel** a non-terminal task — a graceful terminal record (recoverable as a record, never deleted) instead of mislabeling it `failed`
-  - **Quarantine / restore** — isolate a task to `quarantine/` (drops from the list) and restore it later
+- Task list with filters by agent, status, and task type, grouped by target agent
+- Detail view: full task data, history timeline, amendments, and context-ref file previews (confined to the queue and comms directories)
+- Session launch — **review mode** (plan permission; the agent presents a summary and waits) or **auto mode** (the agent claims the task and executes)
+- Lifecycle actions, all proxied through the shared-secret control API as actor `operator`:
+  - **Approve** a submitted or pending task
+  - **Cancel** a non-terminal task — a graceful terminal record, never deleted, instead of mislabelling it `failed`
+  - **Park / Unpark** — pause a task without losing sight of it. A parked task stays in the list, renders muted with an `Unpark` button, is exempt from TTL expiry, and won't be picked up until you unpark it. Unparking returns it to the status it was parked from.
+  - **Amend** — append a correction to a queued task. The original description is never rewritten; amendments render below it, highlighted, so a reader can't act on stale instructions by mistake.
   - **Status change** — advance a task an agent missed (audited operator override)
-- Live connection indicator (WebSocket dot: green = live, grey = disconnected)
-- Manual refresh button
+- Live connection indicator and a manual refresh button
+
+## Non-goals
+
+- **Not a queue schema owner.** Statuses, transitions, and validation belong to `task-queue-mcp`. This plugin renders what that server permits and surfaces its rejections verbatim.
+- **Not an agent runner.** It can spawn a session for a task; it does not supervise, monitor, or manage agents after launch.
+- **Not a general task tracker.** It is scoped to one queue directory of agent-coordination tasks — not a replacement for an issue tracker.
 
 ## Installation
 
-Requires Node.js 20+ and CloudCLI running on `localhost:3001`.
-
 ```bash
-cd ~/repos/personal/cloudcli-plugin-task-queue
 npm install
 ./deploy.sh
 ```
 
-`deploy.sh` builds the TypeScript, copies the plugin to `~/.claude-code-ui/plugins/cloudcli-plugin-task-queue/`, and toggles the plugin via the CloudCLI API to restart the backend server.
+`deploy.sh` builds the TypeScript, copies the plugin into CloudCLI's plugins directory (`~/.claude-code-ui/plugins/cloudcli-plugin-task-queue/`), and prints the restart command. CloudCLI manages the backend process lifecycle.
+
+```bash
+# Required after deploying — the plugin server is reloaded with the host process.
+pm2 restart cloudcli
+```
 
 ## Environment variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `TASK_QUEUE_API` | `http://127.0.0.1:8485` | Base URL of the task-queue-mcp HTTP control API (mutations) |
-| `TASK_QUEUE_API_SECRET` | — | Shared secret sent as `X-Task-Queue-Secret` on every mutation. **Required** — mutations fail closed if unset. Provisioned in `~/.secrets/forge.env`, never in source. |
-| `CLOUDCLI_ORIGIN` | — | Additional allowed WebSocket origin (added to `localhost:3001`) |
+| `TASK_QUEUE_API` | `http://127.0.0.1:8485` | Base URL of the task-queue-mcp HTTP control API. Configurable — the default assumes the MCP server runs loopback-local to CloudCLI. |
+| `TASK_QUEUE_API_SECRET` | — | Shared secret sent as `X-Task-Queue-Secret` on every mutation. **Required** — mutations fail closed if unset. Comes from your secret store, never from source. |
+| `CLOUDCLI_ORIGIN` | — | Additional allowed WebSocket origin. `http://localhost:3001` and `http://127.0.0.1:3001` are always allowed; set this if CloudCLI is served from another origin. |
 
-### How the plugin subprocess receives its env vars
+### How the plugin receives its env vars
 
-CloudCLI launches the backend server (`dist/server.js`) as a subprocess and, by default,
-strips host environment variables from it — including secrets. This plugin's process only
-sees `TASK_QUEUE_API` / `TASK_QUEUE_API_SECRET` because `manifest.json` declares
-`permissions: ["env:TASK_QUEUE_API", "env:TASK_QUEUE_API_SECRET"]`, and CloudCLI passes a
-host env var through to a plugin subprocess only when **both** are true: the manifest
-declares `env:<VAR>` **and** that var is on CloudCLI's host-side `PLUGIN_ENV_ALLOWLIST`.
-Requires a CloudCLI build with this permission-gated env passthrough — without it, the
-launcher silently strips the secret and every control-API mutation fails closed (this broke
-undetected for three weeks starting 2026-06-25; see `CHANGELOG.md` [0.2.0]). Failures in the
-control-API call path (missing secret, unreachable transport) log to
-`~/.pm2/logs/cloudcli-error.log`, never the secret value.
+CloudCLI launches the backend as a subprocess and **strips host environment variables from it by default**, including secrets. A host var reaches the plugin only when **both** are true:
 
-## Dependencies
+1. `manifest.json` declares it — `permissions: ["env:TASK_QUEUE_API", "env:TASK_QUEUE_API_SECRET"]`, and
+2. the var is on CloudCLI's host-side plugin env allowlist.
 
-| Package | Purpose |
-|---------|---------|
-| `ws` | WebSocket server |
+This needs a CloudCLI build with permission-gated env passthrough. **Without it the launcher silently strips the secret and every mutation fails closed** — the UI reports an error, but nothing about the failure names the passthrough as the cause. If mutations fail while reads work, check this first. The control-API call path logs missing-secret and unreachable-transport failures to the CloudCLI process's stderr log, and never logs the secret value.
 
-## Plugin manifest (`manifest.json`)
-
-| Field | Value |
-|-------|-------|
-| `name` | `task-queue` |
-| `displayName` | `Task Queue` |
-| `slot` | `tab` |
-| `entry` | `dist/index.js` (UI) |
-| `server` | `dist/server.js` (backend) |
+Adding a new env var means updating *both* the manifest `permissions` and the host allowlist, or it is silently refused.
 
 ## Backend API
 
-The backend server exposes a small HTTP API consumed by the UI via `api.rpc()`.
+The backend exposes a small HTTP API consumed by the UI via `api.rpc()`.
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Liveness check; returns `{status, uptime, version}` |
-| `GET` | `/tasks` | List tasks; query params: `agent`, `status`, `type` |
-| `GET` | `/tasks/:id` | Task detail + context ref previews |
-| `POST` | `/tasks/:id/start` | Launch headless agent session; body `{mode: "review"\|"auto"}` (client-side spawn, not a queue mutation) |
-| `POST` | `/tasks/:id/approve` | Approve — proxied to the control API |
-| `POST` | `/tasks/:id/cancel` | Cancel (terminal); body `{note?}` — proxied to the control API |
-| `POST` | `/tasks/:id/status` | Operator status change; body `{status, note?, allow_override?}` — proxied to the control API |
-| `POST` | `/tasks/:id/quarantine` | Isolate to `quarantine/` — proxied to the control API |
-| `POST` | `/tasks/:id/restore` | Restore from `quarantine/` — proxied to the control API |
+| `GET` | `/tasks` | List tasks; query params `agent`, `status`, `type` |
+| `GET` | `/tasks/:id` | Task detail plus context-ref previews |
+| `POST` | `/tasks/:id/start` | Launch a session; body `{mode: "review"\|"auto"}` (a local spawn, not a queue mutation) |
+| `POST` | `/tasks/:id/approve` | Approve — proxied |
+| `POST` | `/tasks/:id/cancel` | Cancel (terminal); body `{note?}` — proxied |
+| `POST` | `/tasks/:id/status` | Operator status change; body `{status, note?, allow_override?}` — proxied |
+| `POST` | `/tasks/:id/park` | Park; body `{note?}` — proxied |
+| `POST` | `/tasks/:id/unpark` | Unpark; body `{note?, status?}` — proxied |
+| `POST` | `/tasks/:id/amend` | Append an amendment; body `{amendment, reason?}` — proxied |
 
-Reads (`/tasks`, `/tasks/:id`) are served directly from the queue YAML. Mutations proxy to the `task-queue-mcp` control API with the `X-Task-Queue-Secret` header.
+Reads are served directly from the queue YAML. Every proxied mutation carries the `X-Task-Queue-Secret` header and an `actor` of `operator`.
 
-WebSocket upgrade is handled on the same port. Clients receive `{type: "connected"}` on connect and `{type: "tasks", count, changed}` when task files change.
+WebSocket upgrade is handled on the same port. Clients receive `{type: "connected", version}` on connect and `{type: "tasks", count, changed}` when task files change. The upgrade handler rejects any request whose `Origin` is missing or not allowed.
 
-## Session launch behavior
+## Session launch behaviour
 
 | Mode | Permission mode | Agent prompt |
 |------|----------------|--------------|
-| `review` | `plan` | Read task, present summary, wait for approval |
-| `auto` | `default` | Read task, claim it (in-progress), execute |
+| `review` | `plan` | Read the task, present a summary, wait for approval |
+| `auto` | `default` | Read the task, claim it (`in-progress`), execute |
 
-Agent project directories are resolved from the hardcoded map in `server.js`:
+A task's `target_agent` is mapped to a project directory to launch in. The mapping is **a hardcoded map in `src/server.ts`** — adapting this plugin to a different set of agents means editing that map:
 
-| Agent | Project dir |
-|-------|-------------|
-| `sysadmin` | `~/.claude/projects/sysadmin` |
-| `developer` | `~/.claude/projects/developer` |
-| `research` | `~/.claude/projects/research` |
-| `writer` | `~/.claude/projects/writer` |
-| `security` | `~/.claude/projects/security` |
-
-## Build
-
-```bash
-npm run build
-# Compiles TypeScript + bundles server.js and index.js to dist/
+```ts
+const AGENT_PROJECTS: Record<string, string> = {
+  'my-agent': path.join(HOME, '.claude', 'projects', 'my-agent'),
+  // ...one entry per agent that can be a target_agent
+};
 ```
 
-Build uses `tsc` for type checking and `esbuild` for bundling (ESM format).
+A task whose `target_agent` is absent from the map returns a clean `Unknown agent` error rather than launching.
 
-## Deployment
+## Development
 
-After initial `./deploy.sh`, subsequent deploys follow the same script: build → disable plugin → copy files → re-enable plugin → verify status.
+```bash
+npm install
+npm run build   # tsc --noEmit (typecheck) + esbuild bundle to dist/
+npm test        # node --test — requires Node 22.18+
+```
 
-The plugin lives at `~/.claude-code-ui/plugins/cloudcli-plugin-task-queue/`. CloudCLI manages the backend process lifecycle.
+`npm run build` is the typecheck gate — `tsc --noEmit` runs first and the bundle only happens if it passes.
+
+The test runner executes the `.ts` files directly using Node's built-in type stripping, so **`npm test` needs Node 22.18+** even though the plugin itself runs on Node 20+ (`dist/` is bundled plain JS).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -12,12 +12,24 @@ import { callControlApi, type ControlAction } from './control-api.ts';
 const HOME = process.env.HOME ?? os.homedir();
 const TASK_QUEUE_DIR = path.join(HOME, '.claude', 'task-queue');
 const START_TIME = Date.now();
-const VERSION = '0.2.0';
+
+// Read from package.json rather than hardcoding. A hardcoded copy silently drifted
+// from package.json/manifest.json and shipped a stale version on /health and on the
+// WebSocket `connected` event for two releases.
+const VERSION: string = (() => {
+  try {
+    const pkgPath = new URL('../package.json', import.meta.url);
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as { version?: string };
+    return pkg.version ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+})();
 
 const VALID_ID = /^[a-zA-Z0-9_-]+$/;
 
 // MCP control API — the single validated, shared-secret-gated mutation path. All
-// queue mutations (approve/cancel/status/quarantine/restore) proxy here so they
+// queue mutations (approve/cancel/status/park/unpark/amend) proxy here so they
 // inherit the MCP core's transition validation + fcntl locking. Reads stay direct.
 const TASK_QUEUE_API = (process.env.TASK_QUEUE_API ?? 'http://127.0.0.1:8485').replace(/\/$/, '');
 const TASK_QUEUE_API_SECRET = process.env.TASK_QUEUE_API_SECRET ?? '';
@@ -104,8 +116,16 @@ const PREVIEW_ALLOWED_PREFIXES = [
 ];
 
 function previewFile(filePath: string, lines = 20): string | null {
-  const resolved = path.resolve(filePath);
-  if (!PREVIEW_ALLOWED_PREFIXES.some(p => resolved.startsWith(p + '/'))) return null;
+  // path.resolve normalises `..` but does not resolve symlinks, so a symlink inside an
+  // allowed prefix pointing anywhere on disk would pass the check. realpath first, then
+  // compare — and keep the trailing separator so `/comms-other` can't match `/comms`.
+  let resolved: string;
+  try {
+    resolved = fs.realpathSync(path.resolve(filePath));
+  } catch {
+    return null;
+  }
+  if (!PREVIEW_ALLOWED_PREFIXES.some(p => resolved.startsWith(p + path.sep))) return null;
   try {
     const content = fs.readFileSync(resolved, 'utf-8');
     const result = content.split('\n').slice(0, lines).join('\n');
@@ -293,14 +313,15 @@ const server = http.createServer(async (req, res) => {
 
     // Queue mutations — all proxied to the MCP control API (the single validated,
     // shared-secret-gated write path). No direct YAML mutation happens in the plugin.
-    const mutationMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)\/(approve|cancel|status|quarantine|restore)$/);
+    const mutationMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)\/(approve|cancel|status|park|unpark|amend)$/);
     if (mutationMatch && req.method === 'POST') {
       const mTaskId = mutationMatch[1];
       const action = mutationMatch[2] as ControlAction;
 
       let body: Record<string, unknown> = {};
-      // status and cancel may carry a note / target status; approve/quarantine/restore don't.
-      if (action === 'status' || action === 'cancel') {
+      // status/cancel/park/unpark may carry a note or target status; amend carries the
+      // amendment text. approve carries nothing.
+      if (action !== 'approve') {
         const raw = await readBody(req);
         let parsed: Record<string, unknown> = {};
         try { parsed = raw ? JSON.parse(raw) : {}; } catch { parsed = {}; }
@@ -310,8 +331,12 @@ const server = http.createServer(async (req, res) => {
             note: parsed.note ?? '',
             allow_override: parsed.allow_override ?? false,
           };
-        } else if (parsed.note) {
-          body.note = parsed.note;
+        } else if (action === 'amend') {
+          body = { amendment: parsed.amendment ?? '', reason: parsed.reason ?? '' };
+        } else {
+          if (parsed.note) body.note = parsed.note;
+          // unpark may name an explicit status to return to.
+          if (action === 'unpark' && parsed.status) body.status = parsed.status;
         }
       }
 
@@ -364,7 +389,10 @@ server.on('upgrade', (req, socket, head) => {
     'http://127.0.0.1:3001',
   ].filter(Boolean);
 
-  if (origin && !allowed.includes(origin)) {
+  // Reject a *missing* Origin as well as a wrong one. Browsers always send one, so the
+  // only clients that omit it are non-browser — exactly what this check exists to stop.
+  // Previously `origin && !allowed.includes(origin)` let them skip the check entirely.
+  if (!allowed.includes(origin)) {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
     socket.destroy();
     return;

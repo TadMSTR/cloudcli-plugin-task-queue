@@ -100,6 +100,7 @@ export function statusColor(status: string, c: ThemeColors): string {
     case 'in-progress': return c.accent;
     case 'submitted': return c.muted;
     case 'pending-approval': return c.warn;
+    case 'parked': return c.muted;
     case 'completed': return c.ok;
     case 'failed': return c.error;
     case 'cancelled': return c.muted;

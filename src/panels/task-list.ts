@@ -8,7 +8,9 @@ interface TaskListOptions {
   onApprove: (taskId: string) => void;
   onStart: (taskId: string, mode: 'review' | 'auto') => void;
   onCancel: (taskId: string) => void;
-  onQuarantine: (taskId: string) => void;
+  onPark: (taskId: string) => void;
+  onUnpark: (taskId: string) => void;
+  onAmend: (taskId: string) => void;
   onSetStatus: (taskId: string, status: string) => void;
   filters: { agent: string; status: string; taskType: string };
   onFilterChange: (filters: { agent: string; status: string; taskType: string }) => void;
@@ -19,13 +21,16 @@ const STATUS_ORDER: Record<string, number> = {
   'approved': 1,
   'pending-approval': 2,
   'submitted': 3,
-  'completed': 4,
-  'failed': 5,
-  'cancelled': 6,
+  // Parked sorts below the live statuses but above the terminal ones — it is paused work,
+  // not finished work, and it should not compete for attention with what is actionable.
+  'parked': 4,
+  'completed': 5,
+  'failed': 6,
+  'cancelled': 7,
 };
 
 // Non-terminal statuses an operator can move a task between (the status-change control).
-const NON_TERMINAL_STATUSES = ['submitted', 'pending-approval', 'approved', 'in-progress'];
+const NON_TERMINAL_STATUSES = ['submitted', 'pending-approval', 'approved', 'in-progress', 'parked'];
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
 
 export { NON_TERMINAL_STATUSES, TERMINAL_STATUSES };
@@ -59,11 +64,18 @@ function groupByAgent(tasks: Task[]): Map<string, Task[]> {
 }
 
 export function renderTaskList(container: HTMLElement, opts: TaskListOptions): void {
-  const { tasks, colors: c, filters, onFilterChange, onSelect, onApprove, onStart, onCancel, onQuarantine } = opts;
+  const { tasks, colors: c, filters, onFilterChange, onSelect, onApprove, onStart, onCancel, onPark, onUnpark } = opts;
 
   // Collect unique values for filters
   const agents = [...new Set(tasks.map(t => t.target_agent))].sort();
-  const statuses = [...new Set(tasks.map(t => t.status))].sort();
+  // Union the observed statuses with the known vocabulary, so `parked` is selectable even
+  // when nothing is parked yet — otherwise a brand-new status is undiscoverable until the
+  // operator has already used it somewhere else.
+  const statuses = [...new Set([
+    ...tasks.map(t => t.status),
+    ...NON_TERMINAL_STATUSES,
+    ...TERMINAL_STATUSES,
+  ])].sort();
   const types = [...new Set(tasks.map(t => t.task_type))].sort();
 
   // Apply filters
@@ -140,11 +152,15 @@ export function renderTaskList(container: HTMLElement, opts: TaskListOptions): v
       const pIcon = priorityIcon(priority);
       const pColor = priorityColor(priority, c);
 
+      const isParked = task.status === 'parked';
+
       Object.assign(row.style, {
         display: 'flex', alignItems: 'center', gap: '10px',
         padding: '8px 12px', marginBottom: '2px',
         background: c.surface, border: `1px solid ${c.border}`, borderRadius: '4px',
         cursor: 'pointer', fontSize: '12px', transition: 'border-color 0.15s',
+        // Parked rows read as deliberately set aside: muted and dashed, still present.
+        ...(isParked ? { opacity: '0.65', borderStyle: 'dashed' } : {}),
       });
 
       row.addEventListener('mouseenter', () => { row.style.borderColor = c.accent; });
@@ -179,11 +195,16 @@ export function renderTaskList(container: HTMLElement, opts: TaskListOptions): v
         actions.appendChild(approveBtn);
       }
 
-      // Lifecycle controls: cancel any non-terminal task; quarantine (isolate) any task.
+      // Lifecycle controls: cancel and park/unpark, non-terminal tasks only. Amend lives
+      // in the detail view — it needs the description in front of you to write a useful one.
       if (!TERMINAL_STATUSES.includes(task.status)) {
         actions.appendChild(makeButton('Cancel', c.error, c, () => onCancel(task.id)));
+        actions.appendChild(
+          isParked
+            ? makeButton('Unpark', c.ok, c, () => onUnpark(task.id))
+            : makeButton('Park', c.muted, c, () => onPark(task.id)),
+        );
       }
-      actions.appendChild(makeButton('Quarantine', c.muted, c, () => onQuarantine(task.id)));
 
       row.appendChild(actions);
       group.appendChild(row);

@@ -9,15 +9,18 @@ interface TaskDetailOptions {
   onApprove: (taskId: string) => void;
   onStart: (taskId: string, mode: 'review' | 'auto') => void;
   onCancel: (taskId: string) => void;
-  onQuarantine: (taskId: string) => void;
+  onPark: (taskId: string) => void;
+  onUnpark: (taskId: string) => void;
+  onAmend: (taskId: string) => void;
   onSetStatus: (taskId: string, status: string) => void;
 }
 
 const DETAIL_TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
-const DETAIL_NON_TERMINAL_STATUSES = ['submitted', 'pending-approval', 'approved', 'in-progress'];
+const DETAIL_NON_TERMINAL_STATUSES = ['submitted', 'pending-approval', 'approved', 'in-progress', 'parked'];
 
 export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions): void {
-  const { task, contextPreviews, colors: c, onBack, onApprove, onStart, onCancel, onQuarantine, onSetStatus } = opts;
+  const { task, contextPreviews, colors: c, onBack, onApprove, onStart, onCancel, onPark, onUnpark, onAmend, onSetStatus } = opts;
+  const isParked = task.status === 'parked';
 
   const sc = statusColor(task.status, c);
   const priority = task.payload.priority ?? 'normal';
@@ -76,12 +79,28 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
   if (task.status === 'pending-approval' || task.status === 'submitted') {
     actions.appendChild(makeActionButton('Approve', c.ok, c, () => onApprove(task.id)));
   }
-  // Lifecycle controls: cancel any non-terminal task; quarantine (isolate) any task.
+  // Lifecycle controls: cancel, park/unpark, and amend — all non-terminal only. Parking a
+  // terminal task is meaningless, and amendments to a finished task have no reader.
   if (!DETAIL_TERMINAL_STATUSES.includes(task.status)) {
     actions.appendChild(makeActionButton('Cancel', c.error, c, () => onCancel(task.id)));
+    actions.appendChild(
+      isParked
+        ? makeActionButton('Unpark', c.ok, c, () => onUnpark(task.id))
+        : makeActionButton('Park', c.muted, c, () => onPark(task.id)),
+    );
+    actions.appendChild(makeActionButton('Amend', c.accent, c, () => onAmend(task.id)));
   }
-  actions.appendChild(makeActionButton('Quarantine', c.muted, c, () => onQuarantine(task.id)));
   if (actions.childElementCount > 0) wrapper.appendChild(actions);
+
+  // Parked banner — say plainly what parked means, so the status isn't just a colour.
+  if (isParked) {
+    const banner = document.createElement('div');
+    banner.style.cssText = `padding:8px 12px;margin-bottom:16px;font-size:12px;background:${c.surface};border:1px dashed ${c.muted};border-radius:4px;color:${c.muted};`;
+    banner.textContent = task.parked_from
+      ? `Parked — nothing will pick this up until you unpark it. Unparking returns it to "${task.parked_from}".`
+      : 'Parked — nothing will pick this up until you unpark it.';
+    wrapper.appendChild(banner);
+  }
 
   // Status-change control — advance a task an agent missed (audited operator override).
   if (!DETAIL_TERMINAL_STATUSES.includes(task.status)) {
@@ -125,6 +144,29 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
     wrapper.appendChild(desc);
   }
 
+  // Amendments — corrections that arrived after the task was queued. Rendered directly
+  // below the description and visually distinct, because the whole point is that a reader
+  // who only takes in the description would act on stale instructions.
+  const amendments = task.payload.amendments ?? [];
+  if (amendments.length > 0) {
+    const amendBlock = document.createElement('div');
+    amendBlock.style.cssText = 'margin-bottom:16px;';
+    amendBlock.innerHTML = `<div style="color:${c.warn};font-size:12px;font-weight:600;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">Amendments (${amendments.length}) — read these, the description above is unchanged</div>`;
+
+    for (const a of amendments) {
+      const block = document.createElement('div');
+      block.style.cssText = `margin-bottom:8px;padding:12px;background:${c.surface};border:1px solid ${c.warn};border-left-width:3px;border-radius:4px;`;
+      block.innerHTML = `
+        <div style="color:${c.muted};font-size:11px;margin-bottom:6px">
+          ${escHtml(a.actor)} · ${ago(a.timestamp)}${a.reason ? ` · ${escHtml(a.reason)}` : ''}
+        </div>
+        <pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.5;margin:0;font-family:${MONO}">${escHtml(a.text)}</pre>
+      `;
+      amendBlock.appendChild(block);
+    }
+    wrapper.appendChild(amendBlock);
+  }
+
   // Context ref previews
   if (task.payload.context_refs && task.payload.context_refs.length > 0) {
     const refs = document.createElement('div');
@@ -153,12 +195,15 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
     hist.innerHTML = `<div style="color:${c.accent};font-size:12px;font-weight:600;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">History</div>`;
 
     for (const entry of task.history) {
-      const ec = statusColor(entry.status, c);
+      // Non-status actions (amend) carry the same `status` as the task had at the time,
+      // which would read as a redundant transition. Label the action instead.
+      const label = entry.action ? entry.action : entry.status;
+      const ec = entry.action ? c.warn : statusColor(entry.status, c);
       const line = document.createElement('div');
       line.style.cssText = `display:flex;gap:10px;align-items:flex-start;padding:4px 0;font-size:12px;border-left:2px solid ${c.border};padding-left:12px;margin-left:4px;`;
       line.innerHTML = `
         <span style="color:${c.muted};min-width:55px;font-size:11px">${ago(entry.timestamp)}</span>
-        <span style="color:${ec};min-width:90px">${escHtml(entry.status)}</span>
+        <span style="color:${ec};min-width:90px">${escHtml(label)}</span>
         <span style="color:${c.muted};min-width:70px">${escHtml(entry.actor)}</span>
         <span style="flex:1;color:${c.text}">${escHtml(entry.note || '')}</span>
       `;

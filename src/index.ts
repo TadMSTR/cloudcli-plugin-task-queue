@@ -123,18 +123,46 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     }
   }
 
-  async function handleQuarantine(taskId: string): Promise<void> {
-    if (!confirm('Quarantine (isolate) this task? It drops from the list but can be restored.')) return;
+  async function handlePark(taskId: string): Promise<void> {
+    if (!confirm("Park this task? It stays in the list, marked parked, and won't be picked up until you unpark it.")) return;
     try {
-      await api.rpc('POST', `tasks/${taskId}/quarantine`, { note: 'Quarantined via CloudCLI' });
+      await api.rpc('POST', `tasks/${taskId}/park`, { note: 'Parked via CloudCLI' });
       state.error = null;
-      showToast('Task quarantined');
-      // The task is now hidden; return to the list if we were viewing it.
-      if (state.selectedTaskId === taskId) {
-        state.selectedTaskId = null;
-        state.selectedTask = null;
-      }
+      showToast('Task parked');
+      // The task stays visible — no need to leave the detail view.
       await loadTasks();
+      if (state.selectedTaskId === taskId) await loadTaskDetail(taskId);
+    } catch (err) {
+      state.error = (err as Error).message;
+      render(api.context);
+    }
+  }
+
+  async function handleUnpark(taskId: string): Promise<void> {
+    try {
+      await api.rpc('POST', `tasks/${taskId}/unpark`, { note: 'Unparked via CloudCLI' });
+      state.error = null;
+      showToast('Task unparked');
+      await loadTasks();
+      if (state.selectedTaskId === taskId) await loadTaskDetail(taskId);
+    } catch (err) {
+      state.error = (err as Error).message;
+      render(api.context);
+    }
+  }
+
+  async function handleAmend(taskId: string): Promise<void> {
+    const amendment = prompt(
+      'Append an amendment. The original description is never rewritten — this is added ' +
+      'below it.\n\nIf a task needs more than one or two amendments, cancel and re-queue instead.',
+    );
+    if (!amendment || !amendment.trim()) return;
+    try {
+      await api.rpc('POST', `tasks/${taskId}/amend`, { amendment, reason: 'Amended via CloudCLI' });
+      state.error = null;
+      showToast('Amendment appended');
+      await loadTasks();
+      if (state.selectedTaskId === taskId) await loadTaskDetail(taskId);
     } catch (err) {
       state.error = (err as Error).message;
       render(api.context);
@@ -213,7 +241,9 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
         onApprove: handleApprove,
         onStart: handleStart,
         onCancel: handleCancel,
-        onQuarantine: handleQuarantine,
+        onPark: handlePark,
+        onUnpark: handleUnpark,
+        onAmend: handleAmend,
         onSetStatus: handleSetStatus,
       });
     } else {
@@ -235,7 +265,9 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
         onApprove: handleApprove,
         onStart: handleStart,
         onCancel: handleCancel,
-        onQuarantine: handleQuarantine,
+        onPark: handlePark,
+        onUnpark: handleUnpark,
+        onAmend: handleAmend,
         onSetStatus: handleSetStatus,
       });
     }
