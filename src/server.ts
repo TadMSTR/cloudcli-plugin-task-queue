@@ -7,6 +7,17 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { load as yamlLoad } from 'js-yaml';
 import { callControlApi, type ControlAction } from './control-api.ts';
 import { evaluateUpgrade, allowedOrigins } from './ws-guard.ts';
+import { resolveAllowedPath } from './path-guard.ts';
+import type { HeadlessRun, HeadlessRunDetail } from './types.ts';
+import {
+  parseLaunchLogName,
+  parseRunId,
+  runIdToFilename,
+  runId,
+  firstLine,
+  extractFencedBlocks,
+  runTimes,
+} from './launch-log.ts';
 import {
   loadLaunchPolicy,
   policyPath,
@@ -142,16 +153,10 @@ const PREVIEW_ALLOWED_PREFIXES = [
 ];
 
 function previewFile(filePath: string, lines = 20): string | null {
-  // path.resolve normalises `..` but does not resolve symlinks, so a symlink inside an
-  // allowed prefix pointing anywhere on disk would pass the check. realpath first, then
-  // compare — and keep the trailing separator so `/comms-other` can't match `/comms`.
-  let resolved: string;
-  try {
-    resolved = fs.realpathSync(path.resolve(filePath));
-  } catch {
-    return null;
-  }
-  if (!PREVIEW_ALLOWED_PREFIXES.some(p => resolved.startsWith(p + path.sep))) return null;
+  // The realpath-then-prefix check lives in path-guard.ts — one copy, shared with the
+  // headless-run log reader. See that module for why realpath comes first.
+  const resolved = resolveAllowedPath(filePath, PREVIEW_ALLOWED_PREFIXES);
+  if (!resolved) return null;
   try {
     const content = fs.readFileSync(resolved, 'utf-8');
     const result = content.split('\n').slice(0, lines).join('\n');
@@ -261,6 +266,142 @@ function launchSession(taskId: string, targetAgent: string, mode: StartMode): { 
   }
 }
 
+// ── Headless run reader (read-only) ───────────────────────────────────
+
+// This section READS launch logs and never writes them. Both routes resolve through
+// the shared path guard; neither ever treats a route id as a path.
+
+const HEADLESS_HEAD_BYTES = 2048;
+const HEADLESS_MAX_BYTES = 512 * 1024;
+
+/**
+ * Map an 8-char task-id prefix to the live queue task, for the derived status.
+ *
+ * A log proves a session ran; it does not prove its task closed. When the two
+ * disagree that is real signal, not noise — steward-f42d3aeb is a completed run whose
+ * task sat at `approved` for four days. Render the disagreement; never infer a status
+ * from the log's prose.
+ *
+ * A prefix collision resolves to `unknown` rather than to an arbitrary one of the two.
+ */
+function queueIndexByPrefix(): Map<string, { status: string; taskId: string }> {
+  const idx = new Map<string, { status: string; taskId: string }>();
+  const collided = new Set<string>();
+  for (const t of listTasks()) {
+    const id = typeof t.id === 'string' ? t.id : '';
+    if (!id) continue;
+    const key = id.slice(0, 8);
+    if (collided.has(key)) continue;
+    if (idx.has(key)) { idx.delete(key); collided.add(key); continue; }
+    idx.set(key, { status: typeof t.status === 'string' ? t.status : 'unknown', taskId: id });
+  }
+  return idx;
+}
+
+/** Read at most `bytes` from the head of a file. Never reads a whole log to get one line. */
+function readHead(filePath: string, bytes: number): string {
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(bytes);
+    const n = fs.readSync(fd, buf, 0, bytes, 0);
+    return buf.subarray(0, n).toString('utf-8');
+  } catch {
+    return '';
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* already gone */ } }
+  }
+}
+
+function listHeadlessRuns(agentFilter?: string): HeadlessRun[] {
+  let names: string[];
+  try {
+    names = fs.readdirSync(LAUNCH_LOG_DIR);
+  } catch {
+    return [];   // directory absent is an empty list, not an error
+  }
+
+  const queue = queueIndexByPrefix();
+  const runs: HeadlessRun[] = [];
+
+  for (const name of names) {
+    // Skip anything that is not <agent>-<task8>.log rather than guessing at an agent.
+    // Two pre-2026-08 orphans are named with a bare task UUID and no agent.
+    const parsed = parseLaunchLogName(name);
+    if (!parsed) continue;
+    if (agentFilter && parsed.agent !== agentFilter) continue;
+
+    // The guard runs on the LIST route too, not only on the detail route: this loop
+    // head-reads every file, so a symlink planted in the log dir would otherwise put
+    // the first line of its target into a row.
+    const resolved = resolveAllowedPath(path.join(LAUNCH_LOG_DIR, name), PREVIEW_ALLOWED_PREFIXES);
+    if (!resolved) continue;
+
+    let st: fs.Stats;
+    try { st = fs.statSync(resolved); } catch { continue; }
+    if (!st.isFile()) continue;
+
+    const match = queue.get(parsed.taskId8);
+    runs.push({
+      id: runId(parsed.agent, parsed.taskId8),
+      agent: parsed.agent,
+      task_id8: parsed.taskId8,
+      task_id: match?.taskId ?? null,
+      status: match?.status ?? 'unknown',
+      size: st.size,
+      first_line: firstLine(readHead(resolved, HEADLESS_HEAD_BYTES)),
+      ...runTimes(st),
+    });
+  }
+
+  runs.sort((a, b) => b.ended.localeCompare(a.ended));
+  return runs;
+}
+
+function readHeadlessRun(id: string): HeadlessRunDetail | null {
+  // `id` is validated as <agent>-<task8> and the filename is then REBUILT via
+  // launchLogName, so the caller's string never reaches the filesystem as a path even
+  // before the realpath guard runs. Two independent barriers, deliberately.
+  const parsed = parseRunId(id);
+  if (!parsed) return null;
+
+  const resolved = resolveAllowedPath(
+    path.join(LAUNCH_LOG_DIR, runIdToFilename(parsed)),
+    PREVIEW_ALLOWED_PREFIXES,
+  );
+  if (!resolved) return null;
+
+  let text: string;
+  let truncated: boolean;
+  let fd: number | null = null;
+  try {
+    const st = fs.statSync(resolved);
+    if (!st.isFile()) return null;
+    fd = fs.openSync(resolved, 'r');
+    // Read one byte past the cap so a file exactly at the cap is not called truncated.
+    const buf = Buffer.alloc(HEADLESS_MAX_BYTES + 1);
+    const n = fs.readSync(fd, buf, 0, HEADLESS_MAX_BYTES + 1, 0);
+    truncated = n > HEADLESS_MAX_BYTES;
+    text = buf.subarray(0, Math.min(n, HEADLESS_MAX_BYTES)).toString('utf-8');
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* already gone */ } }
+  }
+
+  const match = queueIndexByPrefix().get(parsed.taskId8);
+  return {
+    id: runId(parsed.agent, parsed.taskId8),
+    agent: parsed.agent,
+    task_id8: parsed.taskId8,
+    task_id: match?.taskId ?? null,
+    status: match?.status ?? 'unknown',
+    text,
+    commands: extractFencedBlocks(text),
+    truncated,
+  };
+}
+
 // ── File watcher ──────────────────────────────────────────────────────
 
 let watchDebounce: ReturnType<typeof setTimeout> | null = null;
@@ -350,6 +491,23 @@ const server = http.createServer(async (req, res) => {
         }
       }
       res.end(JSON.stringify({ task, previews }));
+      return;
+    }
+
+    // List headless runs. Read-only.
+    if (pathname === '/headless-runs' && req.method === 'GET') {
+      const agent = url.searchParams.get('agent');
+      res.end(JSON.stringify({ runs: listHeadlessRuns(agent ?? undefined) }));
+      return;
+    }
+
+    // One headless run's full output. Read-only. The id is matched by the same strict
+    // character class as /tasks/:id and is never treated as a path — see readHeadlessRun.
+    const runMatch = pathname.match(/^\/headless-runs\/([a-zA-Z0-9_-]+)$/);
+    if (runMatch && req.method === 'GET') {
+      const run = readHeadlessRun(runMatch[1]);
+      if (!run) { res.statusCode = 404; res.end(JSON.stringify({ error: 'not found' })); return; }
+      res.end(JSON.stringify(run));
       return;
     }
 

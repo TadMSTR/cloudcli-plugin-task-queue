@@ -1,7 +1,8 @@
-import type { PluginAPI, PluginContext, Task, ThemeColors } from './types.js';
+import type { PluginAPI, PluginContext, Task, ThemeColors, HeadlessRun, HeadlessRunDetail } from './types.js';
 import { themeColors, injectGlobalStyles, MONO } from './panels/styles.js';
 import { renderTaskList } from './panels/task-list.js';
 import { renderTaskDetail } from './panels/task-detail.js';
+import { renderHeadlessRuns } from './panels/headless-runs.js';
 import { createWsClient, WsClient } from './panels/ws-client.js';
 
 // ── State ──────────────────────────────────────────────────────────────
@@ -15,6 +16,10 @@ interface AppState {
   error: string | null;
   wsConnected: boolean;
   filters: { agent: string; status: string; taskType: string };
+  headlessRuns: HeadlessRun[];
+  selectedRunId: string | null;
+  selectedRun: HeadlessRunDetail | null;
+  runAgentFilter: string;
 }
 
 // ── Mount ──────────────────────────────────────────────────────────────
@@ -31,6 +36,10 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     error: null,
     wsConnected: false,
     filters: { agent: '', status: '', taskType: '' },
+    headlessRuns: [],
+    selectedRunId: null,
+    selectedRun: null,
+    runAgentFilter: '',
   };
 
   let wsClient: WsClient | null = null;
@@ -79,8 +88,58 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     } catch (err) {
       state.error = (err as Error).message;
     }
+    await loadHeadlessRuns();
     state.loading = false;
     render(api.context);
+  }
+
+  // Runs refresh on the same cadence as the task list rather than on their own timer.
+  // There is nothing to stream: `claude -p` writes its final message on exit, so a run
+  // only ever changes once, and this surface is opened deliberately.
+  async function loadHeadlessRuns(): Promise<void> {
+    // Loaded UNFILTERED. The agent filter is applied for display in the panel, so it
+    // costs no round trip and — more importantly — runForTask() can still find a task's
+    // run while the section is filtered to a different agent. The route's ?agent=
+    // parameter still exists for direct API use.
+    try {
+      const res = await api.rpc('GET', 'headless-runs') as { runs: HeadlessRun[] };
+      state.headlessRuns = res.runs ?? [];
+    } catch {
+      // A failure here must not blank the task list — the runs section is secondary.
+      state.headlessRuns = [];
+    }
+  }
+
+  async function loadRunDetail(id: string): Promise<void> {
+    try {
+      state.selectedRun = await api.rpc('GET', `headless-runs/${id}`) as HeadlessRunDetail;
+      state.error = null;
+    } catch (err) {
+      state.selectedRunId = null;
+      state.selectedRun = null;
+      state.error = (err as Error).message;
+    }
+    render(api.context);
+  }
+
+  function openRun(id: string): void {
+    state.selectedRunId = id;
+    state.selectedRun = null;
+    state.selectedTaskId = null;
+    state.selectedTask = null;
+    render(api.context);
+    loadRunDetail(id);
+  }
+
+  async function handleCopyCommand(text: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast('Command copied');
+    } catch {
+      // Clipboard access can be refused (insecure context, permissions). Say so rather
+      // than reporting a copy that did not happen.
+      showToast('Copy failed — select the text manually');
+    }
   }
 
   async function loadTaskDetail(taskId: string): Promise<void> {
@@ -261,6 +320,9 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
         onUnpark: handleUnpark,
         onAmend: handleAmend,
         onSetStatus: handleSetStatus,
+        onOpenRun: runForTask(state.selectedTask.id)
+          ? () => openRun(runForTask(state.selectedTask!.id)!.id)
+          : undefined,
       });
     } else {
       const listContainer = document.createElement('div');
@@ -286,7 +348,35 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
         onAmend: handleAmend,
         onSetStatus: handleSetStatus,
       });
+
+      renderHeadlessRuns(root, {
+        runs: state.headlessRuns,
+        selectedRun: state.selectedRun,
+        selectedRunId: state.selectedRunId,
+        agentFilter: state.runAgentFilter,
+        colors: c,
+        onAgentFilterChange: (agent) => {
+          state.runAgentFilter = agent;
+          render(ctx);
+        },
+        onSelect: openRun,
+        onBack: () => {
+          state.selectedRunId = null;
+          state.selectedRun = null;
+          render(ctx);
+        },
+        onCopy: handleCopyCommand,
+      });
     }
+  }
+
+  /**
+   * The launch log for a task, if one was recorded. Matched on the full task id the
+   * backend resolved from the log's 8-char prefix, so a prefix collision (which the
+   * backend reports as unresolved) never links to the wrong task.
+   */
+  function runForTask(taskId: string): HeadlessRun | undefined {
+    return state.headlessRuns.find(r => r.task_id === taskId);
   }
 
   function renderHeader(parent: HTMLElement, c: ThemeColors): void {

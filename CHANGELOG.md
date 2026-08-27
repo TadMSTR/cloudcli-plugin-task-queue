@@ -2,6 +2,56 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-08-27
+
+Adds a **Headless runs** section below the task list: a read-only view of agent sessions
+that ran with nobody watching. The output already existed — every headless launch writes
+its full stdout to `~/.claude/comms/artifacts/task-launches/<agent>-<task8>.log`, and 26
+such logs had accumulated with no interface able to show them. `steward-f42d3aeb`
+completed on 2026-08-23 and stayed invisible for four days.
+
+### Added
+- `GET /headless-runs` and `GET /headless-runs/:id` — read-only, inside the existing
+  preview allowlist. No new `manifest.json` permission and no new env var.
+- `panels/headless-runs.ts` — scannable rows (agent, task id, status, started, duration,
+  first line of output), an agent filter, and a detail view with the full log in
+  monospace. Clicking a row opens it; a task's detail view links to its run output.
+- **Commands** block in the run detail: every fenced code block scraped out of the log,
+  each with a copy button. Deliberately dumb — no inference about which lines are "really"
+  commands. Note that *none* of the 26 pre-existing logs contains a fenced block, so this
+  surfaces nothing until an agent emits one.
+- `path-guard.ts` and `launch-log.ts`, extracted for the reason `ws-guard.ts` was:
+  `server.ts` listens at import time, so a test importing it boots a real listener.
+
+### Changed
+- `previewFile` now calls the shared `resolveAllowedPath` rather than carrying its own
+  copy of the realpath-then-prefix check. One guard, two callers.
+- `HeadlessRun`/`HeadlessRunDetail` live in `types.ts` and are imported by `server.ts`, so
+  the route's response shape has a single definition across the bundle boundary.
+
+### Security
+- The route id is validated as `<agent>-<task8>` and the filename is then *rebuilt* via
+  `launchLogName`, so a caller's string never reaches the filesystem as a path — two
+  independent barriers ahead of the realpath guard. Traversal, encoded traversal, and
+  absolute paths all 404.
+- The path guard applies to the **list** route, not only the detail route. The list
+  head-reads every file, so without it a symlink planted in the log directory renders the
+  first line of its target as a row. Verified both ways against a real symlink to
+  `~/.secrets/forge.env`: it leaked with the guard removed, and is refused with it present.
+- Log text and scraped commands render via `textContent`, never `innerHTML`. Launch logs
+  are agent stdout, which is not trusted markup.
+- Unterminated fenced blocks are dropped from `commands`. They sit behind a copy button
+  and are meant to be pasted into a shell; half a command is worse than none.
+
+### Notes
+- `birthtime` is trusted only when it precedes `mtime`. The 26 historical logs were
+  copy-migrated into the launch-log directory, and a copy resets birthtime while `cp -p`
+  preserves mtime — so trusting it verbatim reported every migrated run as starting "just
+  now" and lasting a negative number of seconds. Those runs now show an unknown duration
+  rather than a wrong one.
+- A run's status is derived from the **queue**, not the log. A log proves a session ran,
+  not that its task closed; the two disagreeing is the signal, not noise.
+
 ## [0.5.0] - 2026-08-27
 
 Requires a launch policy file at `~/scripts/agent-launch.yml` (see README). The Start

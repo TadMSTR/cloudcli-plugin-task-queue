@@ -13,6 +13,12 @@ interface TaskDetailOptions {
   onUnpark: (taskId: string) => void;
   onAmend: (taskId: string) => void;
   onSetStatus: (taskId: string, status: string) => void;
+  /**
+   * Set when a headless launch log exists for this task. This is the affordance that
+   * answers "did that run finish and hand off?" from where the operator already is,
+   * rather than requiring them to scroll to the runs section and match ids by eye.
+   */
+  onOpenRun?: () => void;
 }
 
 const DETAIL_TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
@@ -28,6 +34,7 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
 
   const wrapper = document.createElement('div');
   wrapper.className = 'tq-up';
+  const { onOpenRun } = opts;
 
   // Back button
   const backBtn = document.createElement('button');
@@ -52,6 +59,16 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
     <div style="font-size:15px;font-weight:600;margin-bottom:8px">${escHtml(task.summary)}</div>
   `;
   wrapper.appendChild(header);
+
+  if (onOpenRun) {
+    const runLink = document.createElement('button');
+    runLink.textContent = 'view run output \u2192';
+    runLink.style.cssText = `background:transparent;color:${c.accent};border:1px solid ${c.border};`
+      + `border-radius:3px;padding:3px 10px;font-size:11px;font-family:${MONO};cursor:pointer;`
+      + 'margin-bottom:12px;';
+    runLink.addEventListener('click', onOpenRun);
+    wrapper.appendChild(runLink);
+  }
 
   // Metadata grid
   const meta = document.createElement('div');

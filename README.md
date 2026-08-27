@@ -102,6 +102,8 @@ The backend exposes a small HTTP API consumed by the UI via `api.rpc()`.
 | `POST` | `/tasks/:id/park` | Park; body `{note?}` — proxied |
 | `POST` | `/tasks/:id/unpark` | Unpark; body `{note?, status?}` — proxied |
 | `POST` | `/tasks/:id/amend` | Append an amendment; body `{amendment, reason?}` — proxied |
+| `GET` | `/headless-runs` | List headless agent runs; query param `agent`. Read-only |
+| `GET` | `/headless-runs/:id` | One run's full log text plus scraped commands; `:id` is `<agent>-<task8>`. Read-only |
 
 Reads are served directly from the queue YAML. Every proxied mutation carries the `X-Task-Queue-Secret` header and an `actor` of `operator`.
 

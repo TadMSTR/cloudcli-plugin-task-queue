@@ -22,6 +22,11 @@ src/
   ws-guard.ts           The WebSocket upgrade decision, as a pure function of
                         (peer address, Origin, allowlist). Extracted for the
                         same reason: server.ts listens at import time.
+  path-guard.ts         The realpath-then-prefix filesystem check, in one place.
+                        Used by the context-ref preview AND the headless-run
+                        log reader. Not pure — resolving symlinks is the point.
+  launch-log.ts         Reader side of the launch logs: the inverse of
+                        launchLogName, fenced-block extraction, run timestamps.
   launch-policy.ts      Reads and validates the shared launch roster, and builds
                         the spawn argv. Same extraction reason.
   types.ts              Shared types. The Task shape mirrors task-queue-mcp's
@@ -29,6 +34,7 @@ src/
   panels/
     task-list.ts        List view, filters, grouping, per-row actions
     task-detail.ts      Detail view, history timeline, amendments, previews
+    headless-runs.ts    Headless-run list and log viewer, below the task list
     styles.ts           Theme colours (read live from CloudCLI CSS vars), helpers
     ws-client.ts        Reconnecting WebSocket client
   tests/                node --test
@@ -44,7 +50,12 @@ src/
 - **There is exactly one agent roster, and it is not in this repo.** `~/scripts/agent-launch.yml` (override: `AGENT_LAUNCH_POLICY`) is read by this plugin *and* by `task-dispatcher.py`. A hardcoded `AGENT_PROJECTS` map used to live in `server.ts`; it drifted, lost an agent, and that drift is vikunja#523. Do not add a literal roster back — extend the file.
 - **A run-as agent goes through its launcher, always.** An entry with `run_as_user` is spawned as `sudo -n -u <user> <launcher> …`, never as `claude`. Spawning `claude` directly for such an agent bypasses the launcher's identity guard and yields a session that appears as that agent in every log while holding none of its credentials. A missing or non-executable launcher is refused by name — there is no fallback path, deliberately.
 - **The launch policy fails closed, loudly.** A missing or malformed policy file disables Start with a named error. It must never degrade to an empty policy: an empty policy makes `run_as_user` absent for every agent, which is precisely the impersonation above.
-- **Path guards resolve symlinks.** `previewFile` uses `fs.realpathSync` before the prefix check; `path.resolve` alone normalises `..` but follows nothing, so a symlink inside an allowed prefix would escape it.
+- **Path guards resolve symlinks, and there is one guard.** `resolveAllowedPath` in `path-guard.ts` calls `fs.realpathSync` *before* the prefix compare; `path.resolve` alone normalises `..` but follows nothing, so a symlink inside an allowed prefix would escape it. The trailing `path.sep` on each prefix is load-bearing — without it `/comms-other` matches `/comms`. Both the context-ref preview and the headless-run reader call this one function. Do not write a second check; a subtly different copy is how this property gets lost.
+- **The headless-runs section reads launch logs and never writes them.** Both routes are `GET`, resolve through `resolveAllowedPath`, and never treat a route id as a path: `:id` is validated as `<agent>-<task8>` and the filename is then *rebuilt* via `launchLogName`, so the caller's string cannot reach the filesystem even before the realpath guard runs. The guard applies to the **list** route as well as the detail route — the list head-reads every file, so without it a symlink planted in the log directory puts the first line of its target into a row. That was verified against a real `~/.secrets/forge.env` symlink, which leaked with the guard removed and was refused with it present.
+- **The launch-log filename parser is the inverse of `launchLogName`, and is pinned to it by a round-trip test.** `launch-policy.ts` owns the name shape and two producers write it (this plugin and `task-dispatcher.py`). A hardcoded regex here would not error when it drifted — the section would simply list nothing. Unparseable names are **skipped**, never rendered with a guessed or empty agent.
+- **A run's status comes from the queue, never from the log.** A log proves a session ran; it does not prove its task closed. `steward-f42d3aeb` completed on 2026-08-23 against a task that sat at `approved` for four days. Render that disagreement — do not infer status from the log's prose.
+- **`birthtime` is trusted only when it precedes `mtime`.** The historical logs were copy-migrated into the launch-log directory, and a copy resets birthtime while `cp -p` preserves mtime, so for every migrated run birthtime is *later* than mtime. Trusting it reports each as starting "just now" and running for a negative duration. An untrustworthy birthtime yields a `null` duration, rendered as unknown rather than as zero.
+- **Unterminated fenced blocks are dropped from `commands`.** Those strings are handed to the operator behind a copy button, i.e. built to be pasted into a shell. A fence with no closing delimiter has no known end, and half of a destructive command is worse than none. The full text is still rendered in the log pane.
 - **The WebSocket upgrade gates on the peer address first, and on `Origin` only if one is present.** The server binds `127.0.0.1` on an ephemeral port, so a non-loopback peer is refused outright; a loopback peer with a *present but wrong* `Origin` is still refused. A loopback peer with **no** `Origin` is accepted, because that is CloudCLI's own plugin WS proxy — it uses the `ws` client library, which sends no `Origin` unless one is passed, and its browser leg is already authenticated by CloudCLI's `verifyClient` before the proxy is invoked.
   v0.4.0 inverted this, rejecting a *missing* `Origin` on the reasoning that only non-browser clients omit it. On this deployment the only non-browser client is that trusted proxy, so every connect was 403'd for three weeks (2239 failures) and the tab read `disconnected` throughout. Do not restore the missing-Origin rejection; the loopback bind is the boundary, and `Origin` alone never did the work this deployment needed. The rule is a pure function in `ws-guard.ts` with tests covering all three cases.
 
@@ -56,7 +67,7 @@ npm run build   # tsc --noEmit is the typecheck gate; esbuild bundles after it p
 npm test
 ```
 
-Tests cover `control-api.ts` (the secret gate, task-id validation, header and body shape per action, transport-failure mapping, pass-through of the MCP's authorization rejections), `ws-guard.ts` (all three upgrade cases, including the loopback-with-no-Origin one that v0.4.0 broke), `launch-policy.ts` (every closed-set rejection, whole-document rejection, and both argv shapes), and the reconnect schedule. The UI panels are not unit-tested — verify them in CloudCLI after `./deploy.sh && pm2 restart cloudcli`.
+Tests cover `control-api.ts` (the secret gate, task-id validation, header and body shape per action, transport-failure mapping, pass-through of the MCP's authorization rejections), `ws-guard.ts` (all three upgrade cases, including the loopback-with-no-Origin one that v0.4.0 broke), `launch-policy.ts` (every closed-set rejection, whole-document rejection, and both argv shapes), `path-guard.ts` (a **real** symlink escape, traversal, the `/comms-other` sibling case — with real files in a tmpdir, because a mocked `fs` cannot demonstrate that realpath runs first), `launch-log.ts` (round-trip against the real `launchLogName`, the live bare-UUID orphans, path-shaped route ids, fence extraction including the dropped unterminated case, and the birthtime-after-mtime fallback), and the reconnect schedule. The UI panels are not unit-tested — verify them in CloudCLI after `./deploy.sh && pm2 restart cloudcli`.
 
 Two build/test gotchas worth knowing before you touch either script:
 
