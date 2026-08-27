@@ -270,6 +270,19 @@ function launchSession(taskId: string, targetAgent: string, mode: StartMode): { 
 
 // This section READS launch logs and never writes them. Both routes resolve through
 // the shared path guard; neither ever treats a route id as a path.
+//
+// SECURITY[accepted]: these routes make launch logs — raw `claude -p` stdout — reachable
+// from a browser, where previously they were readable only over SSH. If an agent ever
+// prints a credential into its final message, this surfaces it. Accepted 2026-08-27: the
+// audience does not widen. The backend binds 127.0.0.1 on an ephemeral port and is reached
+// only through CloudCLI's authenticated plugin RPC proxy, so any caller here is already an
+// operator-level principal who can read every task payload, launch sessions as any agent,
+// and cancel work. Reading agent stdout is not a step up from that. Note the surface IS
+// wider than the pre-existing /tasks/:id preview, which returns 20 lines of only the files
+// a task names in context_refs — this returns full text for every log, enumerable. Redaction,
+// if ever wanted, belongs on the two PRODUCERS (task-dispatcher.py and launchSession), not
+// here: a read-only viewer cannot know what a token looks like in arbitrary prose.
+// Audit: 2026-08-27/task-queue-headless-runs-ui-2026-08 (F-01, Low).
 
 const HEADLESS_HEAD_BYTES = 2048;
 const HEADLESS_MAX_BYTES = 512 * 1024;
