@@ -2,6 +2,80 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-08-27
+
+Requires a launch policy file at `~/scripts/agent-launch.yml` (see README). The Start
+button is disabled with a named error if it is missing or malformed — it never falls back
+to a built-in roster, because falling back is what this release removes.
+
+### Fixed
+- **The live WebSocket, dead since v0.4.0.** v0.4.0 tightened the upgrade guard to reject a
+  *missing* `Origin` as well as a wrong one, reasoning that only non-browser clients omit
+  it. The one non-browser client here is CloudCLI's own plugin WS proxy, which uses the
+  `ws` library — and that sends no `Origin` unless explicitly passed. Every upstream
+  handshake was 403'd from 2026-08-02 to 2026-08-27: 2239 `WS proxy error … 403` lines, and
+  a tab that read `disconnected` the whole time. The guard now gates on the **peer**
+  (loopback only, refused outright otherwise) and applies the `Origin` allowlist only when
+  an `Origin` is actually present. A present-but-wrong `Origin` is still refused; the
+  loopback bind was always the real boundary. `AGENTS.md` carried the old rule as a project
+  invariant and has been rewritten — leaving it would have invited the same regression from
+  the next reviewer. New `ws-guard.ts` holds the decision as a pure function, with tests.
+- **The five-second full-panel repaint.** Every failed reconnect emitted `_disconnected`,
+  which called `render()` — and `render()` does `root.innerHTML = ''`. So the entire panel
+  was torn down and rebuilt every 5s while disconnected, losing scroll position and closing
+  any open filter dropdown, even though `wsConnected` was already `false`. Connection state
+  no longer reaches `render()` at all: it updates the header badge in place, and only on a
+  genuine transition.
+- **Start could not launch a run-as agent.** `AGENT_PROJECTS` was a second, drifted copy of
+  `task-dispatcher.py`'s roster with no `steward` entry, so Start refused it outright. The
+  literal is deleted rather than extended: simply adding an entry would have made
+  `launchSession()` spawn `claude` as the plugin's own user, bypassing the launcher whose
+  entire purpose is that agent's isolation — a session appearing as steward in every log
+  and holding none of steward's credentials.
+
+### Added
+- **Reconnect backoff** — 5s → 10s → 30s, capped, reset on a successful open. The first
+  delay is unchanged, so a transient blip still recovers as fast as before; the widening is
+  for outages. A fixed 5s retry is what turned a three-week outage into 2239 identical log
+  lines.
+- **`launch-policy.ts`** — one roster, read by this plugin and by `task-dispatcher.py`, from
+  `~/scripts/agent-launch.yml`. `AGENT_LAUNCH_POLICY` overrides the path. Every field is
+  validated against a closed set (agent name shape, `project_dir` under `~/.claude/projects`,
+  `run_as_user` matching `agent-*`, `launcher` under `/usr/local/sbin/forge/`) and the whole
+  document is rejected on any violation — a partially-honoured roster would silently launch
+  some agent the wrong way. A missing or malformed file is a named error, never an empty
+  policy.
+- An agent carrying `run_as_user` is launched as
+  `sudo -n -u <user> <launcher> --workflow-mode <mode> -- <prompt>`, mirroring the
+  dispatcher. A launcher that is missing or not executable is refused **by name**; it never
+  degrades to spawning `claude`.
+- `env:CLOUDCLI_ORIGIN` in `manifest.json` permissions, so the plugin's allowlist can carry
+  the same origin the host's proxy sends.
+- Tests for the upgrade guard, the reconnect schedule, and the launch policy. The suite grew
+  from 12 to 39.
+
+### Changed
+- **Launch logs moved** to `~/.claude/comms/artifacts/task-launches/<agent>-<task8>.log`.
+  The dispatcher wrote `~/.pm2/logs/agent-launch-<agent>-<task8>.log` and this plugin wrote
+  `<taskId>.log` — two destinations for one concept, so nothing could list "the launches".
+  Both now write the same shape to the same directory. `~/.claude/comms` is the side both
+  can read; `~/.pm2/logs` is not in `PREVIEW_ALLOWED_PREFIXES` and must not be added, since
+  that prefix covers every PM2 service log on the host.
+- **Start's `review` maps to the queue's `semi-auto`** for run-as agents rather than being
+  passed through. `review` is not a value `task-queue-mcp` or `run-steward.sh` accepts —
+  passed through, the launcher refuses it by name. Note that for a run-as agent `review` is
+  **prompt-enforced only**: `run-steward.sh` sets `--dangerously-skip-permissions` itself and
+  accepts no permission mode, so `--permission-mode plan` is not reachable. The toast says so
+  rather than implying a tool gate that is not there.
+- **Symlink handling in the launch-policy validator is now identical to the dispatcher's**
+  (security audit, Low). Neither side resolves symlinks — not in the containment root and
+  not in the candidate `project_dir`. The Python side used to `.resolve()` its root while
+  this side used a plain join, so with a symlink anywhere on the path the two disagreed
+  about the same input. Documented in both files as a rule rather than left as an accident
+  of two independent implementations.
+- A refused WebSocket upgrade now logs why. v0.4.0's refusals were silent on this side; the
+  only signal was a 403 on the far side of the proxy, naming neither leg nor the cause.
+
 ## [0.4.0] - 2026-08-02
 
 Requires [task-queue-mcp](https://github.com/TadMSTR/task-queue-mcp) **v0.4.0** — the

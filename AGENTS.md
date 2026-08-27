@@ -19,6 +19,11 @@ src/
   control-api.ts        The single outbound mutation path to task-queue-mcp.
                         Extracted from server.ts so the auth and transport
                         guards are unit-testable without booting the server.
+  ws-guard.ts           The WebSocket upgrade decision, as a pure function of
+                        (peer address, Origin, allowlist). Extracted for the
+                        same reason: server.ts listens at import time.
+  launch-policy.ts      Reads and validates the shared launch roster, and builds
+                        the spawn argv. Same extraction reason.
   types.ts              Shared types. The Task shape mirrors task-queue-mcp's
                         YAML schema — keep them in step.
   panels/
@@ -36,8 +41,12 @@ src/
 - **The plugin acts as `operator`, never as an agent.** Every proxied mutation sends `actor: 'operator'`. This is what makes the MCP's `amend_task` authorization accept it; the plugin must never assert an agent's identity.
 - **Mutations fail closed without the secret.** `callControlApi` returns 500 and never attempts the fetch when `TASK_QUEUE_API_SECRET` is empty, and logs why. Do not add a fallback that proceeds without it.
 - **The version comes from `package.json`.** `server.ts` reads it at startup rather than hardcoding a copy — a hardcoded constant silently drifted and reported a stale version on `/health` for two releases. `package.json` and `manifest.json` must also agree.
+- **There is exactly one agent roster, and it is not in this repo.** `~/scripts/agent-launch.yml` (override: `AGENT_LAUNCH_POLICY`) is read by this plugin *and* by `task-dispatcher.py`. A hardcoded `AGENT_PROJECTS` map used to live in `server.ts`; it drifted, lost an agent, and that drift is vikunja#523. Do not add a literal roster back — extend the file.
+- **A run-as agent goes through its launcher, always.** An entry with `run_as_user` is spawned as `sudo -n -u <user> <launcher> …`, never as `claude`. Spawning `claude` directly for such an agent bypasses the launcher's identity guard and yields a session that appears as that agent in every log while holding none of its credentials. A missing or non-executable launcher is refused by name — there is no fallback path, deliberately.
+- **The launch policy fails closed, loudly.** A missing or malformed policy file disables Start with a named error. It must never degrade to an empty policy: an empty policy makes `run_as_user` absent for every agent, which is precisely the impersonation above.
 - **Path guards resolve symlinks.** `previewFile` uses `fs.realpathSync` before the prefix check; `path.resolve` alone normalises `..` but follows nothing, so a symlink inside an allowed prefix would escape it.
-- **The WebSocket upgrade rejects a missing Origin**, not just a wrong one. Browsers always send one; only non-browser clients omit it, which is precisely what the check is for.
+- **The WebSocket upgrade gates on the peer address first, and on `Origin` only if one is present.** The server binds `127.0.0.1` on an ephemeral port, so a non-loopback peer is refused outright; a loopback peer with a *present but wrong* `Origin` is still refused. A loopback peer with **no** `Origin` is accepted, because that is CloudCLI's own plugin WS proxy — it uses the `ws` client library, which sends no `Origin` unless one is passed, and its browser leg is already authenticated by CloudCLI's `verifyClient` before the proxy is invoked.
+  v0.4.0 inverted this, rejecting a *missing* `Origin` on the reasoning that only non-browser clients omit it. On this deployment the only non-browser client is that trusted proxy, so every connect was 403'd for three weeks (2239 failures) and the tab read `disconnected` throughout. Do not restore the missing-Origin rejection; the loopback bind is the boundary, and `Origin` alone never did the work this deployment needed. The rule is a pure function in `ws-guard.ts` with tests covering all three cases.
 
 ## Testing
 
@@ -47,7 +56,7 @@ npm run build   # tsc --noEmit is the typecheck gate; esbuild bundles after it p
 npm test
 ```
 
-Tests cover `control-api.ts`: the secret gate, task-id validation, header and body shape per action, transport-failure mapping, and pass-through of the MCP's authorization rejections. The UI panels are not unit-tested — verify them in CloudCLI after `./deploy.sh && pm2 restart cloudcli`.
+Tests cover `control-api.ts` (the secret gate, task-id validation, header and body shape per action, transport-failure mapping, pass-through of the MCP's authorization rejections), `ws-guard.ts` (all three upgrade cases, including the loopback-with-no-Origin one that v0.4.0 broke), `launch-policy.ts` (every closed-set rejection, whole-document rejection, and both argv shapes), and the reconnect schedule. The UI panels are not unit-tested — verify them in CloudCLI after `./deploy.sh && pm2 restart cloudcli`.
 
 Two build/test gotchas worth knowing before you touch either script:
 
