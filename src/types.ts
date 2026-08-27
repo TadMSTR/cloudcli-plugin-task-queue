@@ -82,3 +82,42 @@ export interface Task {
   };
   history: TaskHistoryEntry[];
 }
+
+// ── Headless runs ──────────────────────────────────────────────────────
+
+/**
+ * One headless agent run, derived from its launch log file. Defined here rather than
+ * separately in server.ts and index.ts so the route's response shape has exactly one
+ * definition — the two are a single contract across the bundle boundary.
+ */
+export interface HeadlessRun {
+  /** `<agent>-<task8>` — the route id, and the log filename without `.log`. */
+  id: string;
+  agent: string;
+  task_id8: string;
+  /** Full task id, when a live queue task matches the prefix. */
+  task_id: string | null;
+  /**
+   * Derived from the QUEUE, not from the log. A log proves a session ran; it does not
+   * prove its task closed. When the two disagree that is signal worth rendering.
+   */
+  status: string;
+  started: string;
+  ended: string;
+  /** null when the start time is unknowable — render as unknown, never as zero. */
+  duration_s: number | null;
+  size: number;
+  first_line: string;
+}
+
+export interface HeadlessRunDetail {
+  id: string;
+  agent: string;
+  task_id8: string;
+  task_id: string | null;
+  status: string;
+  text: string;
+  /** Fenced code blocks scraped from the log, offered with copy buttons. */
+  commands: string[];
+  truncated: boolean;
+}
