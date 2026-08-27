@@ -67,6 +67,12 @@ to a built-in roster, because falling back is what this release removes.
   **prompt-enforced only**: `run-steward.sh` sets `--dangerously-skip-permissions` itself and
   accepts no permission mode, so `--permission-mode plan` is not reachable. The toast says so
   rather than implying a tool gate that is not there.
+- **Symlink handling in the launch-policy validator is now identical to the dispatcher's**
+  (security audit, Low). Neither side resolves symlinks — not in the containment root and
+  not in the candidate `project_dir`. The Python side used to `.resolve()` its root while
+  this side used a plain join, so with a symlink anywhere on the path the two disagreed
+  about the same input. Documented in both files as a rule rather than left as an accident
+  of two independent implementations.
 - A refused WebSocket upgrade now logs why. v0.4.0's refusals were silent on this side; the
   only signal was a 403 on the far side of the proxy, naming neither leg nor the cause.
 

@@ -75,6 +75,13 @@ function isUnder(root: string, child: string): boolean {
 }
 
 export function validateLaunchPolicy(raw: unknown, home: string): LaunchPolicy {
+  // Plain join, no symlink resolution — and the Python side's validate_launch_policy()
+  // must keep computing this the same way. It used to call .resolve() here while this
+  // side did not, so with a symlink anywhere on the path the two disagreed: Python
+  // rejected entries this accepted. Neither side resolves the CANDIDATE project_dir
+  // either (it may not exist yet), so resolving only the root compares a canonical path
+  // against an uncanonical one, which is not a comparison at all.
+  // Found by the security audit of task-queue-plugin-repair-2026-08.
   const projectRoot = path.join(home, '.claude', 'projects');
 
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).length === 0) {
