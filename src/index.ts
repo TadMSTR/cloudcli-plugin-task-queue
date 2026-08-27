@@ -36,6 +36,19 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   let wsClient: WsClient | null = null;
   let unsubCtx: (() => void) | null = null;
 
+  // Header badge nodes, re-seated by renderHeader on every render. Mutated in place by
+  // updateConnectionBadge so a connection change costs two property writes, not a repaint.
+  let wsDotEl: HTMLElement | null = null;
+  let wsLabelEl: HTMLElement | null = null;
+
+  function updateConnectionBadge(): void {
+    if (!wsDotEl || !wsLabelEl) return;
+    const c = themeColors(api.context.theme === 'dark');
+    wsDotEl.style.background = state.wsConnected ? c.ok : c.muted;
+    wsDotEl.className = state.wsConnected ? 'tq-live' : '';
+    wsLabelEl.textContent = state.wsConnected ? 'live' : 'disconnected';
+  }
+
   const root = document.createElement('div');
   Object.assign(root.style, {
     height: '100%',
@@ -99,10 +112,13 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
 
   async function handleStart(taskId: string, mode: 'review' | 'auto'): Promise<void> {
     try {
-      await api.rpc('POST', `tasks/${taskId}/start`, { mode });
+      const res = await api.rpc('POST', `tasks/${taskId}/start`, { mode }) as { note?: string };
       state.error = null;
-      // Brief feedback
-      showToast(`Session launched (${mode} mode)`);
+      // Brief feedback. `note` carries a caveat the backend could not honour silently —
+      // e.g. review is prompt-enforced only for a run-as agent, whose launcher accepts
+      // no permission mode. Showing "launched (review mode)" alone would imply a tool
+      // gate that is not there.
+      showToast(res?.note ? `Session launched — ${res.note}` : `Session launched (${mode} mode)`);
     } catch (err) {
       state.error = (err as Error).message;
       render(api.context);
@@ -277,19 +293,20 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     const header = document.createElement('div');
     header.style.cssText = `display:flex;align-items:center;gap:12px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid ${c.border};`;
 
-    const wsColor = state.wsConnected ? c.ok : c.muted;
-    const wsDot = state.wsConnected
-      ? `<span class="tq-live" style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${wsColor}"></span>`
-      : `<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${wsColor}"></span>`;
-
     header.innerHTML = `
       <span style="font-size:14px;font-weight:600;color:${c.accent}">Task Queue</span>
       <span style="color:${c.muted};font-size:11px">${state.tasks.length} tasks</span>
       <span style="margin-left:auto;display:flex;align-items:center;gap:6px">
-        ${wsDot}
-        <span style="color:${c.muted};font-size:11px">${state.wsConnected ? 'live' : 'disconnected'}</span>
+        <span id="tq-ws-dot" style="display:inline-block;width:6px;height:6px;border-radius:50%"></span>
+        <span id="tq-ws-label" style="color:${c.muted};font-size:11px"></span>
       </span>
     `;
+
+    // Cache the badge nodes for updateConnectionBadge(). render() rebuilds the header,
+    // so these are re-seated on every render and must not be captured elsewhere.
+    wsDotEl = header.querySelector<HTMLElement>('#tq-ws-dot');
+    wsLabelEl = header.querySelector<HTMLElement>('#tq-ws-label');
+    updateConnectionBadge();
 
     // Refresh button
     const refreshBtn = document.createElement('button');
@@ -312,12 +329,14 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
 
   wsClient = createWsClient();
   wsClient.onEvent((event) => {
-    if (event.type === '_connected') {
-      state.wsConnected = true;
-      render(api.context);
-    } else if (event.type === '_disconnected') {
-      state.wsConnected = false;
-      render(api.context);
+    if (event.type === '_connected' || event.type === '_disconnected') {
+      const next = event.type === '_connected';
+      // Connection state never reaches render(). render() does root.innerHTML = '',
+      // so calling it from here tore down and rebuilt the whole panel on every failed
+      // reconnect — every 5s, forever, losing scroll position and any open dropdown.
+      if (state.wsConnected === next) return;
+      state.wsConnected = next;
+      updateConnectionBadge();
     } else if (event.type === 'tasks') {
       debouncedRefresh();
     }

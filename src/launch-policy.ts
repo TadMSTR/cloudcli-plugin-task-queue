@@ -1,0 +1,233 @@
+/**
+ * Agent launch policy — the roster of how each agent's session is started.
+ *
+ * This plugin used to carry its own `AGENT_PROJECTS` literal in server.ts: a second
+ * copy of a table `task-dispatcher.py` also spelled twice. It never gained a steward
+ * entry, so the Start button could not launch steward at all — that drift IS
+ * vikunja#523. The literal is deleted; both consumers now read one file,
+ * `~/scripts/agent-launch.yml`, which ships in host-forge/scripts beside the dispatcher.
+ *
+ * Extracted from server.ts for the same reason control-api.ts and ws-guard.ts were:
+ * server.ts calls server.listen() at import time, so a test importing it boots a
+ * listener. Everything here is a pure function of its inputs.
+ *
+ * The validation is not decoration. The literal existed so no value outside a closed
+ * set could reach a subprocess spawn; loading from a file does not preserve that by
+ * itself, so every field is checked here against the same closed set the dispatcher's
+ * validate_launch_policy() uses, and the WHOLE document is rejected on any violation.
+ * A partially-honoured roster would silently launch some agent the wrong way.
+ */
+
+import path from 'node:path';
+import fs from 'node:fs';
+import { load as yamlLoad } from 'js-yaml';
+
+// Closed sets. A policy file cannot introduce a user, a launcher directory, or a
+// project root outside these — it selects from them.
+const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
+const RUN_AS_USER_RE = /^agent-[a-z0-9-]{1,30}$/;
+const LAUNCHER_DIR = '/usr/local/sbin/forge/';
+
+export class LaunchPolicyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LaunchPolicyError';
+  }
+}
+
+export interface AgentLaunch {
+  projectDir: string;
+  /** null for an agent that runs as the plugin's own user. */
+  runAsUser: string | null;
+  /** Non-null if and only if runAsUser is. */
+  launcher: string | null;
+}
+
+export type LaunchPolicy = Record<string, AgentLaunch>;
+
+/**
+ * Look an agent up in the policy. `target_agent` comes from a queue YAML file, so a
+ * plain `policy[agent]` can resolve to `Object.prototype.constructor` and satisfy a
+ * truthiness check with something that is not a policy entry at all.
+ */
+export function lookupAgent(policy: LaunchPolicy, agent: string): AgentLaunch | null {
+  // hasOwnProperty via call, not Object.hasOwn: the project targets ES2020, and
+  // `policy.hasOwnProperty` is itself absent on a null-prototype object.
+  if (typeof agent !== 'string' || !Object.prototype.hasOwnProperty.call(policy, agent)) return null;
+  return policy[agent];
+}
+
+/** Where the policy file lives. AGENT_LAUNCH_POLICY overrides it for tests. */
+export function policyPath(env: NodeJS.ProcessEnv, home: string): string {
+  return env.AGENT_LAUNCH_POLICY || path.join(home, 'scripts', 'agent-launch.yml');
+}
+
+function expandHome(p: string, home: string): string {
+  if (p === '~') return home;
+  if (p.startsWith('~/')) return path.join(home, p.slice(2));
+  return p;
+}
+
+/** True if `child` is `root` itself or lies beneath it. Segment-wise, not by prefix. */
+function isUnder(root: string, child: string): boolean {
+  if (child === root) return true;
+  return child.startsWith(root + path.sep);
+}
+
+export function validateLaunchPolicy(raw: unknown, home: string): LaunchPolicy {
+  const projectRoot = path.join(home, '.claude', 'projects');
+
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw) || Object.keys(raw).length === 0) {
+    throw new LaunchPolicyError('expected a non-empty mapping of agents');
+  }
+
+  // Null prototype, so a lookup by an agent name taken from task content cannot
+  // resolve to an inherited member. `{}['constructor']` is truthy, and the caller's
+  // `if (!entry)` guard would let it through as if it were a policy entry.
+  const policy: LaunchPolicy = Object.create(null) as LaunchPolicy;
+  for (const [agent, entry] of Object.entries(raw as Record<string, unknown>)) {
+    if (!AGENT_NAME_RE.test(agent)) {
+      throw new LaunchPolicyError(`invalid agent name ${JSON.stringify(agent)}`);
+    }
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new LaunchPolicyError(`${agent}: expected a mapping`);
+    }
+    const e = entry as Record<string, unknown>;
+
+    const unknown = Object.keys(e).filter(k => !['project_dir', 'run_as_user', 'launcher'].includes(k));
+    if (unknown.length) {
+      throw new LaunchPolicyError(`${agent}: unknown key(s) ${unknown.sort().join(', ')}`);
+    }
+
+    const rawDir = e.project_dir;
+    if (typeof rawDir !== 'string' || !rawDir) {
+      throw new LaunchPolicyError(`${agent}: project_dir is required`);
+    }
+    const expanded = expandHome(rawDir, home);
+    if (!path.isAbsolute(expanded)) {
+      throw new LaunchPolicyError(`${agent}: project_dir must be absolute: ${rawDir}`);
+    }
+    // Normalise `..` before the containment check. path.normalize does not follow
+    // symlinks, which is right here — the directory may legitimately not exist yet,
+    // and the caller reports that with a better message than this could.
+    const projectDir = path.normalize(expanded);
+    if (!isUnder(projectRoot, projectDir)) {
+      throw new LaunchPolicyError(`${agent}: project_dir must be under ${projectRoot}: ${rawDir}`);
+    }
+
+    const runAsUser = e.run_as_user ?? null;
+    const launcher = e.launcher ?? null;
+    if ((runAsUser === null) !== (launcher === null)) {
+      throw new LaunchPolicyError(`${agent}: run_as_user and launcher must be given together`);
+    }
+    if (runAsUser !== null) {
+      if (typeof runAsUser !== 'string' || !RUN_AS_USER_RE.test(runAsUser)) {
+        throw new LaunchPolicyError(`${agent}: invalid run_as_user ${JSON.stringify(runAsUser)}`);
+      }
+      if (typeof launcher !== 'string' || !launcher.startsWith(LAUNCHER_DIR)) {
+        throw new LaunchPolicyError(`${agent}: launcher must be under ${LAUNCHER_DIR}: ${JSON.stringify(launcher)}`);
+      }
+      if (path.normalize(launcher) !== launcher) {
+        throw new LaunchPolicyError(`${agent}: launcher must be a normalised path: ${JSON.stringify(launcher)}`);
+      }
+    }
+
+    policy[agent] = {
+      projectDir,
+      runAsUser: runAsUser as string | null,
+      launcher: launcher as string | null,
+    };
+  }
+  return policy;
+}
+
+/** Read and validate the policy file. Throws LaunchPolicyError; never returns {}. */
+export function loadLaunchPolicy(filePath: string, home: string): LaunchPolicy {
+  let text: string;
+  try {
+    text = fs.readFileSync(filePath, 'utf-8');
+  } catch (err) {
+    throw new LaunchPolicyError(`cannot read launch policy ${filePath}: ${(err as Error).message}`);
+  }
+  let raw: unknown;
+  try {
+    raw = yamlLoad(text);
+  } catch (err) {
+    throw new LaunchPolicyError(`cannot parse launch policy ${filePath}: ${(err as Error).message}`);
+  }
+  return validateLaunchPolicy(raw, home);
+}
+
+// ── Launch mode vocabulary ───────────────────────────────────────────────────
+
+/** What the plugin's Start button sends. */
+export type StartMode = 'review' | 'auto';
+/** What task-queue-mcp and run-steward.sh accept. */
+export type WorkflowMode = 'semi-auto' | 'auto' | 'manual-then-auto';
+
+/**
+ * The plugin's Start vocabulary is not the queue's. `review` is a UI word for "let me
+ * see it before it runs"; the queue's nearest value is `semi-auto`. Mapped explicitly
+ * rather than passed through: `review` is not in task-queue-mcp's VALID_WORKFLOW_MODES,
+ * and run-steward.sh would reject it by name. See vikunja#533 for the wider unification.
+ */
+export function toWorkflowMode(mode: StartMode): WorkflowMode {
+  return mode === 'review' ? 'semi-auto' : 'auto';
+}
+
+// ── argv construction ────────────────────────────────────────────────────────
+
+export interface LaunchArgv {
+  argv: string[];
+  /** Surfaced to the operator when the requested mode could not be honoured literally. */
+  note?: string;
+}
+
+/**
+ * Build the spawn argv for an agent, mirroring task-dispatcher.py's launch path.
+ *
+ * A run-as agent goes through its launcher, never through `claude` directly. Spawning
+ * `claude` as the plugin's own user for such an agent is the failure this replaces: it
+ * bypasses the launcher's identity guard, producing a session that appears as that
+ * agent in every log while holding none of its credentials (vikunja#404, #523).
+ */
+export function buildLaunchArgv(
+  entry: AgentLaunch,
+  mode: StartMode,
+  prompt: string,
+  claudeBin: string,
+): LaunchArgv {
+  if (entry.runAsUser && entry.launcher) {
+    // -n: never prompt for a password. The sudoers grant is NOPASSWD, so a prompt
+    // would mean the grant is gone — fail immediately rather than hang on a tty
+    // that does not exist.
+    // --: everything after is the prompt, not a flag.
+    const argv = [
+      'sudo', '-n', '-u', entry.runAsUser,
+      entry.launcher,
+      '--workflow-mode', toWorkflowMode(mode),
+      '--', prompt,
+    ];
+    // run-steward.sh sets --dangerously-skip-permissions itself and accepts no
+    // permission-mode, so `review` cannot be enforced by the CLI for a run-as agent
+    // the way it is for one launched directly. The review prompt still instructs the
+    // agent to stop and wait, but that is a prompt-level control, not a tool gate.
+    // Say so rather than implying a guarantee that is not there.
+    const note = mode === 'review'
+      ? 'review is prompt-enforced for this agent — its launcher does not accept a permission mode'
+      : undefined;
+    return { argv, note };
+  }
+
+  const permissionMode = mode === 'review' ? 'plan' : 'default';
+  return { argv: [claudeBin, '-p', prompt, '--permission-mode', permissionMode] };
+}
+
+/**
+ * Launch-log filename. Shared with task-dispatcher.py, which writes the same shape into
+ * the same directory — previously it wrote ~/.pm2/logs/agent-launch-<agent>-<task8>.log
+ * while this plugin wrote <taskId>.log, so nothing could list "the launches".
+ */
+export function launchLogName(agent: string, taskId: string): string {
+  return `${agent}-${taskId.slice(0, 8)}.log`;
+}

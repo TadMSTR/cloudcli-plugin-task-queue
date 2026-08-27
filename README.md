@@ -72,13 +72,14 @@ pm2 restart cloudcli
 |----------|---------|---------|
 | `TASK_QUEUE_API` | `http://127.0.0.1:8485` | Base URL of the task-queue-mcp HTTP control API. Configurable — the default assumes the MCP server runs loopback-local to CloudCLI. |
 | `TASK_QUEUE_API_SECRET` | — | Shared secret sent as `X-Task-Queue-Secret` on every mutation. **Required** — mutations fail closed if unset. Comes from your secret store, never from source. |
-| `CLOUDCLI_ORIGIN` | — | Additional allowed WebSocket origin. `http://localhost:3001` and `http://127.0.0.1:3001` are always allowed; set this if CloudCLI is served from another origin. |
+| `CLOUDCLI_ORIGIN` | — | Additional allowed WebSocket origin, and the origin the CloudCLI host's plugin proxy sends on its upstream leg. Both sides read the same variable so they cannot disagree. `http://localhost:3001` and `http://127.0.0.1:3001` are always allowed. |
+| `AGENT_LAUNCH_POLICY` | `~/scripts/agent-launch.yml` | Path to the launch policy file (see [Session launch behaviour](#session-launch-behaviour)). |
 
 ### How the plugin receives its env vars
 
 CloudCLI launches the backend as a subprocess and **strips host environment variables from it by default**, including secrets. A host var reaches the plugin only when **both** are true:
 
-1. `manifest.json` declares it — `permissions: ["env:TASK_QUEUE_API", "env:TASK_QUEUE_API_SECRET"]`, and
+1. `manifest.json` declares it — `permissions: ["env:TASK_QUEUE_API", "env:TASK_QUEUE_API_SECRET", "env:CLOUDCLI_ORIGIN"]`, and
 2. the var is on CloudCLI's host-side plugin env allowlist.
 
 This needs a CloudCLI build with permission-gated env passthrough. **Without it the launcher silently strips the secret and every mutation fails closed** — the UI reports an error, but nothing about the failure names the passthrough as the cause. If mutations fail while reads work, check this first. The control-API call path logs missing-secret and unreachable-transport failures to the CloudCLI process's stderr log, and never logs the secret value.
@@ -104,7 +105,11 @@ The backend exposes a small HTTP API consumed by the UI via `api.rpc()`.
 
 Reads are served directly from the queue YAML. Every proxied mutation carries the `X-Task-Queue-Secret` header and an `actor` of `operator`.
 
-WebSocket upgrade is handled on the same port. Clients receive `{type: "connected", version}` on connect and `{type: "tasks", count, changed}` when task files change. The upgrade handler rejects any request whose `Origin` is missing or not allowed.
+WebSocket upgrade is handled on the same port. Clients receive `{type: "connected", version}` on connect and `{type: "tasks", count, changed}` when task files change.
+
+The upgrade handler gates on the **peer address** first: the server binds `127.0.0.1` on an ephemeral port, so a non-loopback peer is refused outright. An `Origin` is then checked against the allowlist **only if one is present**. A loopback peer that sends no `Origin` is accepted, because that is what CloudCLI's own plugin WS proxy looks like — the `ws` client library sends no `Origin` unless one is passed, and that leg is already authenticated by CloudCLI before the proxy is invoked. A present-but-wrong `Origin` is still refused.
+
+> Do not "harden" this by rejecting a missing `Origin`. v0.4.0 did exactly that and 403'd every connect for three weeks, because the only client that reaches this port is the trusted proxy. The loopback bind is the boundary. The rule is a pure function in `src/ws-guard.ts` with tests for all three cases.
 
 ## Session launch behaviour
 
@@ -113,16 +118,54 @@ WebSocket upgrade is handled on the same port. Clients receive `{type: "connecte
 | `review` | `plan` | Read the task, present a summary, wait for approval |
 | `auto` | `default` | Read the task, claim it (`in-progress`), execute |
 
-A task's `target_agent` is mapped to a project directory to launch in. The mapping is **a hardcoded map in `src/server.ts`** — adapting this plugin to a different set of agents means editing that map:
+### The launch policy file
 
-```ts
-const AGENT_PROJECTS: Record<string, string> = {
-  'my-agent': path.join(HOME, '.claude', 'projects', 'my-agent'),
-  // ...one entry per agent that can be a target_agent
-};
+A task's `target_agent` is resolved through a **data file**, not a map in the source:
+`~/scripts/agent-launch.yml` by default, overridable with `AGENT_LAUNCH_POLICY`. Adapting
+this plugin to a different set of agents means editing that file — no rebuild.
+
+```yaml
+my-agent:
+  project_dir: ~/.claude/projects/my-agent
+
+# An agent that must NOT run as the plugin's own user:
+my-isolated-agent:
+  project_dir: ~/.claude/projects/my-isolated-agent
+  run_as_user: agent-my-isolated-agent
+  launcher: /usr/local/sbin/forge/run-my-isolated-agent.sh
 ```
 
-A task whose `target_agent` is absent from the map returns a clean `Unknown agent` error rather than launching.
+The file is deliberately shared with whatever else launches your agents (on the reference
+deployment, a cron dispatcher reads the same file). A second copy of this roster is what
+this release removes: the plugin's private map had drifted and was missing an agent
+entirely, so Start refused it.
+
+**`run_as_user` is the part that matters.** An entry carrying it is launched as
+`sudo -n -u <user> <launcher> --workflow-mode <mode> -- <prompt>` — never as `claude`
+directly. That indirection exists because such an agent's credentials are readable only by
+that user; spawning `claude` as the plugin's own user instead would produce a session that
+appears as the agent in every log while holding none of its credentials. If the launcher is
+missing or not executable, Start fails **by name**; it does not fall back.
+
+Every field is validated against a closed set — agent name shape, `project_dir` under
+`~/.claude/projects`, `run_as_user` matching `agent-*`, `launcher` under
+`/usr/local/sbin/forge/` — and the whole document is rejected on any violation. A missing or
+malformed file disables Start with a named error rather than yielding an empty policy, since
+an empty policy makes `run_as_user` absent for *every* agent.
+
+A task whose `target_agent` is absent from the file returns a clean `Unknown agent` error
+rather than launching.
+
+> **Mode vocabulary.** Start sends `review | auto`; a launcher taking `--workflow-mode`
+> receives `semi-auto | auto`, mapped explicitly. For a run-as agent, `review` is
+> **prompt-enforced only** — the reference launcher sets `--dangerously-skip-permissions`
+> itself and accepts no permission mode, so `--permission-mode plan` is not reachable. The
+> UI says so on launch rather than implying a tool gate.
+
+### Launch logs
+
+Each launch appends to `~/.claude/comms/artifacts/task-launches/<agent>-<task8>.log`, the
+same shape and directory the reference dispatcher writes, so both are listable together.
 
 ## Development
 

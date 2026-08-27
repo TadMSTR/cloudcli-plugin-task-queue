@@ -10,6 +10,24 @@ export type WsEvent = {
 
 export type WsListener = (event: WsEvent) => void;
 
+/**
+ * Reconnect backoff: 5s, 10s, 30s, then 30s forever. Reset to the first step on a
+ * successful open.
+ *
+ * A fixed 5s retry against a persistent outage is what produced 2239 identical
+ * "WS proxy error" lines in cloudcli-error.log over three weeks — enough noise to
+ * bury anything else in that log.
+ *
+ * Exported for tests: the schedule is the behaviour, and it is not observable
+ * through the client without waiting real seconds.
+ */
+export const RECONNECT_DELAYS_MS = [5000, 10000, 30000] as const;
+
+export function reconnectDelayMs(attempt: number): number {
+  const i = Math.min(Math.max(attempt, 0), RECONNECT_DELAYS_MS.length - 1);
+  return RECONNECT_DELAYS_MS[i];
+}
+
 export interface WsClient {
   readonly connected: boolean;
   onEvent(listener: WsListener): () => void;
@@ -22,6 +40,7 @@ export function createWsClient(): WsClient {
   let connected = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let closed = false;
+  let reconnectAttempt = 0;
 
   function getWsUrl(): string {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -43,6 +62,7 @@ export function createWsClient(): WsClient {
 
       ws.onopen = () => {
         connected = true;
+        reconnectAttempt = 0;   // a real connect resets the backoff
         emit({ type: '_connected' });
       };
 
@@ -69,10 +89,12 @@ export function createWsClient(): WsClient {
 
   function scheduleReconnect(): void {
     if (closed || reconnectTimer) return;
+    const delay = reconnectDelayMs(reconnectAttempt);
+    reconnectAttempt += 1;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connect();
-    }, 5000);
+    }, delay);
   }
 
   connect();
