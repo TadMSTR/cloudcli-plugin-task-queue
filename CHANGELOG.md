@@ -42,6 +42,13 @@ completed on 2026-08-23 and stayed invisible for four days.
   are agent stdout, which is not trusted markup.
 - Unterminated fenced blocks are dropped from `commands`. They sit behind a copy button
   and are meant to be pasted into a shell; half a command is worse than none.
+- Security audit 2026-08-27: **PASS**, no Critical/High/Medium. One Low was **accepted** —
+  these routes make launch logs (raw agent stdout) reachable from a browser, where they were
+  previously readable only over SSH. Accepted because the audience does not widen: the
+  backend is loopback-bound and reached only through CloudCLI's authenticated plugin RPC
+  proxy, so any caller is already an operator-level principal. The surface *is* wider than
+  the pre-existing `/tasks/:id` context-ref preview; redaction, if wanted, belongs on the
+  log producers rather than on a read-only viewer. See `SECURITY[accepted]` in `server.ts`.
 
 ### Notes
 - `birthtime` is trusted only when it precedes `mtime`. The 26 historical logs were
