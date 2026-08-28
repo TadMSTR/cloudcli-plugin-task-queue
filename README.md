@@ -46,6 +46,37 @@ Live updates arrive over WebSocket: the backend watches the queue directory and 
   - **Status change** — advance a task an agent missed (audited operator override)
 - Live connection indicator and a manual refresh button
 
+## Headless runs
+
+Below the task list, a read-only section lists agent sessions launched with no operator
+watching — steward in particular runs as `agent-steward` under `claude -p`, emits one block
+of final text, and exits. Every such launch already wrote its full stdout to
+`~/.claude/comms/artifacts/task-launches/<agent>-<task8>.log`; before this section existed,
+26 of these had accumulated with nothing able to show them, and one completed steward run
+stayed invisible for four days.
+
+Each row shows agent, short task id, status, started, duration, and the first line of
+output. Click a row to open the full log.
+
+**Status comes from the task queue, not from the log.** A log proves a session ran; it does
+not prove the task closed. The two disagreeing — a finished run whose task is still
+`approved` — is the feature working, not a bug.
+
+**Duration can be unknown**, rendered as an em dash. It's derived from the log file's
+timestamps, and birthtime is only trusted when it precedes mtime. Every log migrated into
+the shared directory on 2026-08-27 was copied rather than moved, and a copy resets birthtime
+while preserving mtime — so those runs show an unknown duration rather than a wrong one.
+
+Below the log text, a **Commands** block lists every fenced code block scraped from the
+output, each with a copy button. The extraction is deliberately dumb — no inference about
+which lines are "really" commands, no language-tag filtering — except that an **unterminated
+fence is dropped**: a fence with no closing delimiter has no known end, and these strings are
+meant to be pasted into a shell.
+
+Both routes (`GET /headless-runs`, `GET /headless-runs/:id`) are read-only, resolve through
+the same realpath path guard as the rest of the plugin, and need no new manifest permission
+or env var — see [Backend API](#backend-api).
+
 ## Non-goals
 
 - **Not a queue schema owner.** Statuses, transitions, and validation belong to `task-queue-mcp`. This plugin renders what that server permits and surfaces its rejections verbatim.
