@@ -21,6 +21,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { load as yamlLoad } from 'js-yaml';
+import type { WorkflowMode } from './vocabulary.ts';
 
 // Closed sets. A policy file cannot introduce a user, a launcher directory, or a
 // project root outside these — it selects from them.
@@ -169,17 +170,33 @@ export function loadLaunchPolicy(filePath: string, home: string): LaunchPolicy {
 
 /** What the plugin's Start button sends. */
 export type StartMode = 'review' | 'auto';
-/** What task-queue-mcp and run-steward.sh accept. */
-export type WorkflowMode = 'semi-auto' | 'auto' | 'manual-then-auto';
+/**
+ * What task-queue-mcp and run-steward.sh accept. Sourced from `vocabulary.ts` rather than
+ * spelled again here — this file had its own copy, and copies of this list are vikunja#558.
+ */
+export type { WorkflowMode };
 
 /**
  * The plugin's Start vocabulary is not the queue's. `review` is a UI word for "let me
  * see it before it runs"; the queue's nearest value is `semi-auto`. Mapped explicitly
  * rather than passed through: `review` is not in task-queue-mcp's VALID_WORKFLOW_MODES,
  * and run-steward.sh would reject it by name. See vikunja#533 for the wider unification.
+ *
+ * `queuedMode` is the mode the task was SUBMITTED with, and it exists for exactly one
+ * value. `manual-then-auto` gates its own leg like `semi-auto` but hands `auto` to
+ * everything the session spawns; run-steward.sh implements that downgrade and rejects
+ * nothing here. Collapsing it to `semi-auto` on the way out — which is what this function
+ * did before #543 — silently pins every downstream handoff back to `semi-auto`, which is
+ * the failure vikunja#533 added the mode to fix: four security->steward return tasks sat
+ * unactioned for over a week. `review` means "gate this leg", and `manual-then-auto` is
+ * the spelling of that which preserves the rest of the chain.
+ *
+ * An explicit `auto` Start still wins: the operator has said run the whole thing
+ * unattended, and a `manual-then-auto` task's children were going to be `auto` regardless.
  */
-export function toWorkflowMode(mode: StartMode): WorkflowMode {
-  return mode === 'review' ? 'semi-auto' : 'auto';
+export function toWorkflowMode(mode: StartMode, queuedMode?: string): WorkflowMode {
+  if (mode === 'auto') return 'auto';
+  return queuedMode === 'manual-then-auto' ? 'manual-then-auto' : 'semi-auto';
 }
 
 // ── argv construction ────────────────────────────────────────────────────────
@@ -203,6 +220,7 @@ export function buildLaunchArgv(
   mode: StartMode,
   prompt: string,
   claudeBin: string,
+  queuedMode?: string,
 ): LaunchArgv {
   if (entry.runAsUser && entry.launcher) {
     // -n: never prompt for a password. The sudoers grant is NOPASSWD, so a prompt
@@ -212,7 +230,7 @@ export function buildLaunchArgv(
     const argv = [
       'sudo', '-n', '-u', entry.runAsUser,
       entry.launcher,
-      '--workflow-mode', toWorkflowMode(mode),
+      '--workflow-mode', toWorkflowMode(mode, queuedMode),
       '--', prompt,
     ];
     // run-steward.sh sets --dangerously-skip-permissions itself and accepts no
@@ -220,9 +238,13 @@ export function buildLaunchArgv(
     // the way it is for one launched directly. The review prompt still instructs the
     // agent to stop and wait, but that is a prompt-level control, not a tool gate.
     // Say so rather than implying a guarantee that is not there.
-    const note = mode === 'review'
+    let note = mode === 'review'
       ? 'review is prompt-enforced for this agent — its launcher does not accept a permission mode'
       : undefined;
+    if (mode === 'review' && queuedMode === 'manual-then-auto') {
+      note = (note ? note + '. ' : '')
+        + 'queued manual-then-auto — this leg is gated, everything it spawns runs auto';
+    }
     return { argv, note };
   }
 

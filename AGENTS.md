@@ -33,6 +33,9 @@ src/
                         launchLogName, fenced-block extraction, run timestamps.
   launch-policy.ts      Reads and validates the shared launch roster, and builds
                         the spawn argv. Same extraction reason.
+  vocabulary.ts         The task-queue vocabulary (statuses, task types, workflow
+                        modes) plus the UI maps keyed BY it. One copy, gated
+                        against task-queue-mcp's main. See the invariant below.
   types.ts              Shared types. The Task shape mirrors task-queue-mcp's
                         YAML schema — keep them in step.
   panels/
@@ -42,13 +45,29 @@ src/
     dead-letters.ts     Collapsed dead-letter section, grouped by failure reason
     styles.ts           Theme colours (read live from CloudCLI CSS vars), helpers
     ws-client.ts        Reconnecting WebSocket client
+  gates/
+    python-sets.ts      Extracts `NAME = {"a","b"}` literals from Python source,
+                        without executing any. Split out of the gate script so it
+                        can be tested; that script exits at module scope.
+    vocabulary-parity.ts  CI gate: fetches task-queue-mcp `main` and asserts the
+                        vocabulary matches. Own npm script, own CI step.
   tests/                node --test
 ```
+
+**Relative imports use `.ts`, not `.js`.** `npm test` runs the sources directly under Node's
+type stripping, which does not rewrite a `.js` specifier to the `.ts` file beside it — so a
+module reached by a test through a `.js` import fails with `ERR_MODULE_NOT_FOUND`. The panels
+all used `.js` and were simply never imported by a test; the first one that was, was not
+importable. esbuild and `tsc` (`allowImportingTsExtensions`) both accept `.ts`.
 
 ## Invariants
 
 - **The plugin never writes queue YAML directly.** Reads are direct (fast, watchable); every mutation goes through `control-api.ts` to the MCP control API, inheriting its transition validation, `fcntl` locking, and atomic writes. A new mutation means a new control-API action, never an `fs.writeFile`.
 - **`ControlAction` must match the MCP's route set.** The union type in `control-api.ts`, the route regex in `server.ts`, and the MCP's custom routes are three copies of one contract. Change one, change all three. The two copies that live in *this* repo are now pinned to each other by a source-level test in `control-api.test.ts` — nothing detected the drift before, because adding an action to the union alone compiles and the failure mode is a button that 404s against the plugin's own backend. The third copy is in another repo and still needs a human.
+- **The task-queue vocabulary lives in `vocabulary.ts`, once, and is gated against its owner.** This plugin does not own the queue's statuses, task types, or workflow modes — `task-queue-mcp`'s `src/tools/queue.py` does. It used to carry four partial hand-written copies (`STATUS_ORDER`, `NON_TERMINAL_STATUSES`, `DETAIL_NON_TERMINAL_STATUSES`, the `statusColor` switch); none of them learned about `routing-failed`, so for months the status most in need of an operator sorted *below* `cancelled`, rendered the same grey as `parked`, and was not offered by the status filter. `manual-then-auto` was the same omission one field over. Two mechanisms hold the line and they are different in kind: `npm run gate:vocabulary` fetches the MCP's `main` and fails on any difference, which catches "upstream changed and we did not"; and the UI maps are `Record<Status, …>` keyed by the vocabulary itself, so adding a status without giving it a sort position and a colour is a `tsc` error rather than a silent fallthrough to `?? 9` and `muted`. Do not weaken either — a `Record<string, …>` accepts anything and covers nothing, which is precisely how this happened.
+- **The vocabulary gate has no skip-on-no-network path, and tracks `main`, not a pin.** It exits non-zero if it cannot read the upstream. A check that quietly passes when it could not reach its source of truth is indistinguishable from one that verified something, and that shape is how the dispatcher-side instance (vikunja#324) stayed open for months. It likewise exits non-zero if it parses zero set literals, rather than reporting a vacuous pass over an empty comparison. A vocabulary change merged upstream turning this repo's CI red is the alarm working. `TASK_QUEUE_MCP_REF` exists only for a paired pre-merge change from a shell; **CI must not set it**.
+- **The gate is its own CI step.** A red vocabulary means "go edit `src/vocabulary.ts`" — a different instruction from any unit failure. Folded into `npm test` either could hide the other, and an expected-red check buried inside a longer step masks whether anything before it ran.
+- **A queued `manual-then-auto` survives the Start button.** `toWorkflowMode` maps the UI's `review` to `semi-auto` *unless* the task was queued `manual-then-auto`, in which case it passes that through. Both gate this leg; only the second lets the tasks the session spawns run `auto`. Flattening it — which is what this did before #543 — re-pins the whole downstream chain to `semi-auto`, which is the failure vikunja#533 added the mode to fix. An explicit `auto` Start still overrides.
 - **The plugin acts as `operator`, never as an agent.** Every proxied mutation sends `actor: 'operator'`. This is what makes the MCP's `amend_task` authorization accept it; the plugin must never assert an agent's identity.
 - **Mutations fail closed without the secret.** `callControlApi` returns 500 and never attempts the fetch when `TASK_QUEUE_API_SECRET` is empty, and logs why. Do not add a fallback that proceeds without it.
 - **The version comes from `package.json`.** `server.ts` reads it at startup rather than hardcoding a copy — a hardcoded constant silently drifted and reported a stale version on `/health` for two releases. `package.json` and `manifest.json` must also agree.
@@ -72,14 +91,16 @@ src/
 
 ```bash
 npm install
-npm run build   # tsc --noEmit is the typecheck gate; esbuild bundles after it passes
+npm run build          # tsc --noEmit is the typecheck gate; esbuild bundles after it passes
 npm test
+npm run gate:vocabulary  # parity with task-queue-mcp main — needs network, by design
 ```
 
-Tests cover `control-api.ts` (the secret gate, task-id validation, header and body shape per action, transport-failure mapping, pass-through of the MCP's authorization rejections, and the union/route-regex drift gate), `dead-letters.ts` (the real dispatcher record shape including the `Date`-valued `created` js-yaml hands back, the id-less and reason-less fallbacks, and the grouping rule against the live seventeen-identical-reasons case), `ws-guard.ts` (all three upgrade cases, including the loopback-with-no-Origin one that v0.4.0 broke), `launch-policy.ts` (every closed-set rejection, whole-document rejection, and both argv shapes), `path-guard.ts` (a **real** symlink escape, traversal, the `/comms-other` sibling case — with real files in a tmpdir, because a mocked `fs` cannot demonstrate that realpath runs first), `launch-log.ts` (round-trip against the real `launchLogName`, the live bare-UUID orphans, path-shaped route ids, fence extraction including the dropped unterminated case, and the birthtime-after-mtime fallback), and the reconnect schedule. The UI panels are not unit-tested — verify them in CloudCLI after `./deploy.sh && pm2 restart cloudcli`.
+Tests cover `control-api.ts` (the secret gate, task-id validation, header and body shape per action, transport-failure mapping, pass-through of the MCP's authorization rejections, and the union/route-regex drift gate), `dead-letters.ts` (the real dispatcher record shape including the `Date`-valued `created` js-yaml hands back, the id-less and reason-less fallbacks, and the grouping rule against the live seventeen-identical-reasons case), `ws-guard.ts` (all three upgrade cases, including the loopback-with-no-Origin one that v0.4.0 broke), `launch-policy.ts` (every closed-set rejection, whole-document rejection, and both argv shapes), `path-guard.ts` (a **real** symlink escape, traversal, the `/comms-other` sibling case — with real files in a tmpdir, because a mocked `fs` cannot demonstrate that realpath runs first), `launch-log.ts` (round-trip against the real `launchLogName`, the live bare-UUID orphans, path-shaped route ids, fence extraction including the dropped unterminated case, and the birthtime-after-mtime fallback), `vocabulary.ts` (every status has a sort position and a colour, `routing-failed` sorts above `in-progress` and is not muted, the derived non-terminal set, and the `manual-then-auto` pass-through through `buildLaunchArgv`), `gates/python-sets.ts` (the real `queue.py` shape including interleaved comments, and the two constructs that must NOT parse as string sets — a derived set and an annotated dict), and the reconnect schedule. The UI panels are not otherwise unit-tested — verify them in CloudCLI after `./deploy.sh && pm2 restart cloudcli`.
 
 Two build/test gotchas worth knowing before you touch either script:
 
+- **`npm run gate:vocabulary` reaches the network and has no offline mode.** It is not part of `npm test` — run it separately, and expect it to fail on a disconnected machine. That is the design, not a bug; see the invariant above.
 - **`npm test` needs Node 22.18+.** `node --test` runs the `.ts` test files directly, relying on Node's built-in type stripping. On Node 20 every test fails with `ERR_UNKNOWN_FILE_EXTENSION`. The plugin's *runtime* requirement is still Node 20+ — `dist/` is bundled plain JS — so the README's stated minimum and CI's Node version differ on purpose.
 - **`npm run build` invokes `tsc`/`esbuild` from `node_modules/.bin`, not via bare `npx`.** `npx tsc` silently downloads an unrelated registry package named `tsc` when devDependencies are missing, replacing the typecheck gate with a stranger's binary. Do not "simplify" it back to `npx`.
 

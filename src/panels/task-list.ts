@@ -1,5 +1,26 @@
-import type { ThemeColors, Task } from '../types.js';
-import { escHtml, ago, statusColor, priorityColor, priorityIcon, MONO } from './styles.js';
+import type { ThemeColors, Task } from '../types.ts';
+import { escHtml, ago, statusColor, priorityColor, priorityIcon, MONO } from './styles.ts';
+import {
+  STATUS_ORDER,
+  VALID_STATUSES,
+  VALID_TASK_TYPES,
+  VALID_WORKFLOW_MODES,
+  WORKFLOW_MODE_DISPLAY,
+  isTerminal,
+  isWorkflowMode,
+} from '../vocabulary.ts';
+
+/**
+ * The list's filter state. `mode` filters on `workflow_mode` — added with #543, because the
+ * queue's three modes are the difference between "an operator has to press Start" and "this
+ * and everything downstream of it runs unattended", and there was no way to ask which.
+ */
+export interface TaskFilters {
+  agent: string;
+  status: string;
+  taskType: string;
+  mode: string;
+}
 
 interface TaskListOptions {
   tasks: Task[];
@@ -12,28 +33,9 @@ interface TaskListOptions {
   onUnpark: (taskId: string) => void;
   onAmend: (taskId: string) => void;
   onSetStatus: (taskId: string, status: string) => void;
-  filters: { agent: string; status: string; taskType: string };
-  onFilterChange: (filters: { agent: string; status: string; taskType: string }) => void;
+  filters: TaskFilters;
+  onFilterChange: (filters: TaskFilters) => void;
 }
-
-const STATUS_ORDER: Record<string, number> = {
-  'in-progress': 0,
-  'approved': 1,
-  'pending-approval': 2,
-  'submitted': 3,
-  // Parked sorts below the live statuses but above the terminal ones — it is paused work,
-  // not finished work, and it should not compete for attention with what is actionable.
-  'parked': 4,
-  'completed': 5,
-  'failed': 6,
-  'cancelled': 7,
-};
-
-// Non-terminal statuses an operator can move a task between (the status-change control).
-const NON_TERMINAL_STATUSES = ['submitted', 'pending-approval', 'approved', 'in-progress', 'parked'];
-const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
-
-export { NON_TERMINAL_STATUSES, TERMINAL_STATUSES };
 
 const PRIORITY_ORDER: Record<string, number> = {
   'urgent': 0,
@@ -41,13 +43,17 @@ const PRIORITY_ORDER: Record<string, number> = {
   'normal': 2,
 };
 
-function sortTasks(tasks: Task[]): Task[] {
+export function sortTasks(tasks: Task[]): Task[] {
   return [...tasks].sort((a, b) => {
     const pa = PRIORITY_ORDER[a.payload.priority ?? 'normal'] ?? 2;
     const pb = PRIORITY_ORDER[b.payload.priority ?? 'normal'] ?? 2;
     if (pa !== pb) return pa - pb;
-    const sa = STATUS_ORDER[a.status] ?? 9;
-    const sb = STATUS_ORDER[b.status] ?? 9;
+    // The `?? 99` is for a status written by something newer than this build, not for one
+    // the plugin knows about: STATUS_ORDER is keyed by the vocabulary, so a known status
+    // without a position does not compile. `routing-failed` reaching this fallback and
+    // sorting below `cancelled` is vikunja#558.
+    const sa = STATUS_ORDER[a.status as keyof typeof STATUS_ORDER] ?? 99;
+    const sb = STATUS_ORDER[b.status as keyof typeof STATUS_ORDER] ?? 99;
     if (sa !== sb) return sa - sb;
     return new Date(b.created).getTime() - new Date(a.created).getTime();
   });
@@ -71,18 +77,24 @@ export function renderTaskList(container: HTMLElement, opts: TaskListOptions): v
   // Union the observed statuses with the known vocabulary, so `parked` is selectable even
   // when nothing is parked yet — otherwise a brand-new status is undiscoverable until the
   // operator has already used it somewhere else.
-  const statuses = [...new Set([
-    ...tasks.map(t => t.status),
-    ...NON_TERMINAL_STATUSES,
-    ...TERMINAL_STATUSES,
+  const statuses = [...new Set([...tasks.map(t => t.status), ...VALID_STATUSES])].sort();
+  const types = [...new Set([...tasks.map(t => t.task_type), ...VALID_TASK_TYPES])].sort();
+  // Same union for modes. Not derived from the tasks alone: `manual-then-auto` exists to be
+  // asked for, and until one is queued nothing would offer it (vikunja#543).
+  const modes = [...new Set([
+    ...tasks.map(t => t.workflow_mode).filter((m): m is string => !!m),
+    ...VALID_WORKFLOW_MODES,
   ])].sort();
-  const types = [...new Set(tasks.map(t => t.task_type))].sort();
 
   // Apply filters
   let filtered = tasks;
   if (filters.agent) filtered = filtered.filter(t => t.target_agent === filters.agent);
   if (filters.status) filtered = filtered.filter(t => t.status === filters.status);
   if (filters.taskType) filtered = filtered.filter(t => t.task_type === filters.taskType);
+  // A record with no `workflow_mode` matches no mode filter rather than being folded into
+  // the queue's default. Older tasks predate the field; claiming they are `semi-auto` would
+  // be this plugin inventing a value the queue never wrote.
+  if (filters.mode) filtered = filtered.filter(t => t.workflow_mode === filters.mode);
 
   const sorted = sortTasks(filtered);
   const grouped = groupByAgent(sorted);
@@ -114,12 +126,23 @@ export function renderTaskList(container: HTMLElement, opts: TaskListOptions): v
         ${types.map(t => `<option value="${escHtml(t)}" ${filters.taskType === t ? 'selected' : ''}>${escHtml(t)}</option>`).join('')}
       </select>
     </label>
+    <label style="color:${c.muted};font-size:12px">Mode
+      <select id="tq-filter-mode" style="${selectStyle}">
+        <option value="">all</option>
+        ${modes.map(m => `<option value="${escHtml(m)}" ${filters.mode === m ? 'selected' : ''}>${escHtml(m)}</option>`).join('')}
+      </select>
+    </label>
     <span style="color:${c.muted};font-size:11px;margin-left:auto">${filtered.length} of ${tasks.length} tasks</span>
   `;
   container.appendChild(filterBar);
 
   // Bind filter events
-  for (const [id, key] of [['tq-filter-agent', 'agent'], ['tq-filter-status', 'status'], ['tq-filter-type', 'taskType']] as const) {
+  for (const [id, key] of [
+    ['tq-filter-agent', 'agent'],
+    ['tq-filter-status', 'status'],
+    ['tq-filter-type', 'taskType'],
+    ['tq-filter-mode', 'mode'],
+  ] as const) {
     const el = filterBar.querySelector(`#${id}`) as HTMLSelectElement;
     el?.addEventListener('change', () => {
       onFilterChange({ ...filters, [key]: el.value });
@@ -169,12 +192,21 @@ export function renderTaskList(container: HTMLElement, opts: TaskListOptions): v
 
       const shortId = task.id.slice(0, 8);
 
+      // Mode marker, shown only when the mode changes what happens without an operator.
+      // `semi-auto` is 98% of the queue and is what a reader already assumes; badging it
+      // too would make the column noise instead of signal.
+      const mode = task.workflow_mode;
+      const modeBadge = isWorkflowMode(mode) && mode !== 'semi-auto'
+        ? `<span style="color:${c[WORKFLOW_MODE_DISPLAY[mode].tone]};font-size:10px;border:1px solid currentColor;border-radius:3px;padding:0 4px;flex-shrink:0" title="${escHtml(WORKFLOW_MODE_DISPLAY[mode].hint)}">${escHtml(mode)}</span>`
+        : '';
+
       row.innerHTML = `
         <span style="color:${c.muted};min-width:64px;font-size:11px" title="${escHtml(task.id)}">${escHtml(shortId)}</span>
         ${pIcon ? `<span style="color:${pColor};font-size:11px;font-weight:700;min-width:24px">${pIcon}</span>` : '<span style="min-width:24px"></span>'}
         <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${sc};flex-shrink:0" title="${escHtml(task.status)}"></span>
         <span style="color:${sc};min-width:90px;font-size:11px">${escHtml(task.status)}</span>
         <span style="color:${c.muted};min-width:60px;font-size:11px">${escHtml(task.task_type)}</span>
+        ${modeBadge}
         <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(task.summary)}">${escHtml(task.summary)}</span>
         <span style="color:${c.muted};font-size:11px;min-width:55px;text-align:right">${ago(task.created)}</span>
       `;
@@ -197,7 +229,7 @@ export function renderTaskList(container: HTMLElement, opts: TaskListOptions): v
 
       // Lifecycle controls: cancel and park/unpark, non-terminal tasks only. Amend lives
       // in the detail view — it needs the description in front of you to write a useful one.
-      if (!TERMINAL_STATUSES.includes(task.status)) {
+      if (!isTerminal(task.status)) {
         actions.appendChild(makeButton('Cancel', c.error, c, () => onCancel(task.id)));
         actions.appendChild(
           isParked

@@ -227,10 +227,14 @@ A task whose `target_agent` is absent from the file returns a clean `Unknown age
 rather than launching.
 
 > **Mode vocabulary.** Start sends `review | auto`; a launcher taking `--workflow-mode`
-> receives `semi-auto | auto`, mapped explicitly. For a run-as agent, `review` is
-> **prompt-enforced only** — the reference launcher sets `--dangerously-skip-permissions`
-> itself and accepts no permission mode, so `--permission-mode plan` is not reachable. The
-> UI says so on launch rather than implying a tool gate.
+> receives `semi-auto | auto | manual-then-auto`, mapped explicitly. `auto` passes through.
+> `review` becomes `semi-auto`, **except** for a task queued as `manual-then-auto`, which is
+> passed through unchanged: both gate this leg, but only `manual-then-auto` lets the tasks
+> that session spawns run unattended, and flattening it re-pins the whole chain to
+> `semi-auto`. For a run-as agent, `review` is **prompt-enforced only** — the reference
+> launcher sets `--dangerously-skip-permissions` itself and accepts no permission mode, so
+> `--permission-mode plan` is not reachable. The UI says so on launch rather than implying a
+> tool gate.
 
 ### Launch logs
 
@@ -243,6 +247,9 @@ same shape and directory the reference dispatcher writes, so both are listable t
 npm install
 npm run build   # tsc --noEmit (typecheck) + esbuild bundle to dist/
 npm test        # node --test — requires Node 22.18+
+npm run gate:vocabulary   # asserts the queue vocabulary matches task-queue-mcp's main.
+                          # Reaches the network and fails if it cannot — deliberately;
+                          # a parity check that skips offline has verified nothing.
 ```
 
 `npm run build` is the typecheck gate — `tsc --noEmit` runs first and the bundle only happens if it passes.

@@ -11,7 +11,7 @@
 // without a DOM, and so the reason-grouping rule — the thing that turns seventeen rows
 // into one problem — is a pure function with tests rather than a loop inside a renderer.
 
-import type { DeadLetter, DeadLetterGroup } from './types.js';
+import type { DeadLetter, DeadLetterGroup } from './types.ts';
 
 /** The `failed_reason` shape task-dispatcher writes. Every field is optional in practice. */
 interface RawFailedReason {

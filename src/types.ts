@@ -67,8 +67,25 @@ export interface Task {
   status: string;
   summary: string;
   ttl_days: number;
+  /**
+   * `semi-auto` | `auto` | `manual-then-auto` — see `vocabulary.ts`. Optional because
+   * records written before task-queue-mcp added the field carry none, and a task with no
+   * recorded mode is rendered as unknown rather than as the queue's default.
+   */
+  workflow_mode?: string;
   /** Status to return to on unpark. Present only while status === 'parked'. */
   parked_from?: string;
+  /**
+   * Written by task-dispatcher while a task sits at `routing-failed`. Read-only here — it
+   * is what lets the detail panel say when the next attempt is due instead of leaving the
+   * status as a bare word.
+   */
+  retry_policy?: {
+    retry_count?: number;
+    max_retries?: number;
+    next_retry_at?: string | null;
+    last_failure_reason?: string;
+  };
   payload: {
     description: string;
     context_refs?: string[];
