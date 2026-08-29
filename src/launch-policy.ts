@@ -69,6 +69,14 @@ function expandHome(p: string, home: string): string {
   return p;
 }
 
+/**
+ * Drop a trailing path separator, so this side agrees with Python's os.path.normpath.
+ * The filesystem root is left alone — '/' is not a trailing separator on a name.
+ */
+function stripTrailingSep(p: string): string {
+  return p.length > 1 && p.endsWith(path.sep) ? p.slice(0, -1) : p;
+}
+
 /** True if `child` is `root` itself or lies beneath it. Segment-wise, not by prefix. */
 function isUnder(root: string, child: string): boolean {
   if (child === root) return true;
@@ -118,7 +126,17 @@ export function validateLaunchPolicy(raw: unknown, home: string): LaunchPolicy {
     // Normalise `..` before the containment check. path.normalize does not follow
     // symlinks, which is right here — the directory may legitimately not exist yet,
     // and the caller reports that with a better message than this could.
-    const projectDir = path.normalize(expanded);
+    //
+    // The trailing separator is then stripped, and that is NOT cosmetic. Node's
+    // path.normalize KEEPS a trailing slash ('/a/b/' -> '/a/b/') while Python's
+    // os.path.normpath removes it ('/a/b/' -> '/a/b'), so a roster entry written with
+    // one produced two different strings on the two sides for the same input — and
+    // that string becomes a spawn's cwd. Both sides accepted the entry, so no verdict
+    // ever disagreed; only the resolved value did. This is the .resolve() divergence
+    // in a second costume, and it is why the shared corpus compares resolved values
+    // rather than just accept/reject. Found by that corpus
+    // (tests/fixtures/launch-policy-corpus.json in task-dispatcher), not by review.
+    const projectDir = stripTrailingSep(path.normalize(expanded));
     if (!isUnder(projectRoot, projectDir)) {
       throw new LaunchPolicyError(`${agent}: project_dir must be under ${projectRoot}: ${rawDir}`);
     }

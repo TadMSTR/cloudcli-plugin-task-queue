@@ -254,6 +254,44 @@ deployment, a cron dispatcher reads the same file). A second copy of this roster
 this release removes: the plugin's private map had drifted and was missing an agent
 entirely, so Start refused it.
 
+#### Two validators, one corpus
+
+`~/scripts/agent-launch.yml` is validated independently by this plugin and by the cron
+dispatcher, in two languages, with no shared code. They have already disagreed: one
+resolved symlinks on the project root and the other did not, so an entry accepted here was
+rejected there — and on the reference deployment that did not merely reject an entry, it
+made the dispatcher fail to import on every tick.
+
+`npm run gate:corpus` closes that. task-dispatcher owns
+`tests/fixtures/launch-policy-corpus.json`, a set of accept/reject cases; this plugin
+fetches it from that repo's `main` and asserts its own validator agrees on every one.
+
+It compares **resolved values**, not just verdicts, and that is not belt-and-braces. Its
+first run found a second live divergence: Node's `path.normalize` keeps a trailing
+separator where Python's `os.path.normpath` strips it, so a `project_dir` written with a
+trailing slash was accepted by both sides and resolved to two different strings — one of
+which becomes a spawned session's working directory. No verdict ever disagreed.
+
+#### Pre-launch credential guards
+
+A Start of a directly-launched agent is refused, by name, if `SCOPED_MCP_BEARER_TOKEN` is
+unresolved or no usable Anthropic credential is available. Without this, such a session
+spawns and then fails deep inside — a 401 from every scoped-mcp tool, or a `claude -p`
+that short-circuits to "Not logged in" before it reads the prompt. From the operator's
+side both look like an agent that started and did nothing.
+
+The plugin also layers `/opt/appdata/agents/<agent>/.env` into the child environment,
+which the dispatcher has always done and this plugin did not. That is the substance of the
+fix rather than a side effect: on the reference deployment the plugin's own process
+carries no `SCOPED_MCP_BEARER_TOKEN`, so directly-launched sessions were genuinely
+starting without one.
+
+**Neither guard runs for a `run_as_user` agent, and that asymmetry is deliberate.** Such
+an agent's credentials are not in this process's environment by design — they are in a
+file only the target user can read, sourced by the launcher as that user, which performs
+the equivalent checks itself. Running these checks on that path would fail every launch
+for the one agent whose isolation is working correctly.
+
 **`run_as_user` is the part that matters.** An entry carrying it is launched as
 `sudo -n -u <user> <launcher> --workflow-mode <mode> -- <prompt>` — never as `claude`
 directly. That indirection exists because such an agent's credentials are readable only by
@@ -310,10 +348,17 @@ then, and reporting the launch as failed would be the bigger lie.
 npm install
 npm run build   # tsc --noEmit (typecheck) + esbuild bundle to dist/
 npm test        # node --test — requires Node 22.18+
-npm run gate:vocabulary   # asserts the queue vocabulary matches task-queue-mcp's main.
-                          # Reaches the network and fails if it cannot — deliberately;
-                          # a parity check that skips offline has verified nothing.
+npm run gate:vocabulary   # asserts the queue vocabulary matches task-queue-mcp's main
+npm run gate:corpus       # asserts the launch-policy validator agrees with
+                          # task-dispatcher's, over a corpus that repo owns
 ```
+
+Both gates reach the network and fail if they cannot — deliberately; a parity check that
+skips offline has verified nothing. They are **separate** npm scripts and separate CI
+steps because they read different upstreams: a red from one means "edit
+`src/vocabulary.ts`" and a red from the other means "edit `src/launch-policy.ts`". Folding
+them together would let either hide the other, and would make "which upstream moved" a log
+dive.
 
 `npm run build` is the typecheck gate — `tsc --noEmit` runs first and the bundle only happens if it passes.
 

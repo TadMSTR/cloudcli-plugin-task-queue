@@ -1,8 +1,8 @@
 {
   "name": "task-queue",
   "displayName": "Task Queue",
-  "version": "0.9.0",
-  "description": "Task queue dashboard — view, filter, and launch agent tasks.",
+  "version": "0.10.0",
+  "description": "Task queue dashboard \u2014 view, filter, and launch agent tasks.",
   "author": "TadMSTR",
   "icon": "icon.svg",
   "type": "module",

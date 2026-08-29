@@ -45,6 +45,17 @@ jobs:
       - name: Vocabulary parity with task-queue-mcp main
         run: npm run gate:vocabulary
 
+      # Its own step for the same reason, and separate from the vocabulary gate because
+      # it reads a DIFFERENT upstream: this one goes red when task-dispatcher's launch
+      # policy corpus changes, which is a different instruction again ("go make
+      # launch-policy.ts match"). One step per upstream, so which one moved is legible
+      # from the job list rather than from a log dive.
+      #
+      # Do NOT set TASK_DISPATCHER_REF here — it defaults to `main`, which is what the
+      # dispatcher is actually running.
+      - name: Launch policy parity with task-dispatcher main
+        run: npm run gate:corpus
+
       # Production dependencies only. The dev tree carries advisories that do not
       # apply to a plugin bundled at build time and never served by a dev server.
       - name: Audit production dependencies
