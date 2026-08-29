@@ -156,6 +156,28 @@ export interface HeadlessRun {
   duration_s: number | null;
   size: number;
   first_line: string;
+  /**
+   * True when a run record was found beside the log. False for the 29 logs that predate
+   * run records, whose times are still derived from file mtimes — the fields below are
+   * all null for those, and the UI says "no run record" rather than implying an outcome.
+   */
+  has_record: boolean;
+  /** 'dispatcher' | 'dispatcher-audit' | 'plugin', or null without a record. */
+  launched_by: string | null;
+  /**
+   * How the run ended, in one phrase, or null while it is open or unrecorded. NEVER
+   * derived from the log's prose — see outcomeLabel().
+   */
+  outcome: string | null;
+  /** null is an honest unknown for a dispatcher launch, not a missing value. */
+  exit_code: number | null;
+  /**
+   * False when the record names a log this UI may not read — the security-audit launcher
+   * writes to ~/.pm2/logs, which is deliberately outside the preview allowlist because
+   * that prefix covers every PM2 service log on the host. The row still renders; the
+   * detail view says where the log is instead of pretending it is empty.
+   */
+  log_readable: boolean;
 }
 
 export interface HeadlessRunDetail {
@@ -168,4 +190,11 @@ export interface HeadlessRunDetail {
   /** Fenced code blocks scraped from the log, offered with copy buttons. */
   commands: string[];
   truncated: boolean;
+  has_record: boolean;
+  launched_by: string | null;
+  outcome: string | null;
+  exit_code: number | null;
+  /** Absolute path of the log, from the record. Shown when it is not readable here. */
+  log_path: string | null;
+  log_readable: boolean;
 }

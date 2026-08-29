@@ -170,6 +170,28 @@ export function loadLaunchPolicy(filePath: string, home: string): LaunchPolicy {
 
 /** What the plugin's Start button sends. */
 export type StartMode = 'review' | 'auto';
+
+/** The closed set behind StartMode, so the type can be checked at runtime too. */
+export const START_MODES: readonly StartMode[] = ['review', 'auto'];
+
+/**
+ * A `mode` off the wire, or null if it is not one.
+ *
+ * `POST /tasks/:id/start` used to type-ASSERT its body (`JSON.parse(body) as {mode}`),
+ * which is a compile-time claim and no runtime check at all. That was harmless while the
+ * value only ever reached `=== 'review'` comparisons that fell through safely — but the
+ * run-record build gave it a second consumer that writes it into a task's PERSISTED
+ * history note, and a value that lands in a durable record deserves a validator.
+ *
+ * ABSENT IS NOT INVALID. An omitted mode keeps the long-standing `review` default: the
+ * safe leg, the one that reads the task and waits. A PRESENT but unrecognised mode is
+ * null and the caller must refuse it — defaulting there would silently downgrade an
+ * operator who asked for `auto`, turning a typo into a session that quietly does nothing.
+ */
+export function toStartMode(raw: unknown): StartMode | null {
+  if (raw === undefined || raw === null) return 'review';
+  return (START_MODES as readonly string[]).includes(raw as string) ? (raw as StartMode) : null;
+}
 /**
  * What task-queue-mcp and run-steward.sh accept. Sourced from `vocabulary.ts` rather than
  * spelled again here — this file had its own copy, and copies of this list are vikunja#558.
@@ -259,4 +281,13 @@ export function buildLaunchArgv(
  */
 export function launchLogName(agent: string, taskId: string): string {
   return `${agent}-${taskId.slice(0, 8)}.log`;
+}
+
+/**
+ * Run-record filename — the log's stem with a `.json` suffix. Also shared with
+ * task-dispatcher (run_record_name()). Defined here rather than in run-record.ts so the
+ * two names that must agree sit next to each other; splitting them is how the stem drifts.
+ */
+export function runRecordFileName(agent: string, taskId: string): string {
+  return `${agent}-${taskId.slice(0, 8)}.json`;
 }
