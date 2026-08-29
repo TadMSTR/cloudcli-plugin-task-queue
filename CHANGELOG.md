@@ -2,6 +2,68 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-08-29
+
+Tracker: vikunja#560. Build plan: agent-workflow-interop-2026-08, Phase 5.5 and 5.6.
+
+### Fixed
+
+- **A trailing slash in `project_dir` resolved differently here than in the dispatcher.**
+  Node's `path.normalize` keeps a trailing separator (`/a/b/` → `/a/b/`) where Python's
+  `os.path.normpath` strips it (`/a/b/` → `/a/b`). Both sides ACCEPTED the entry, so no
+  verdict ever disagreed — only the resolved value did, and that value becomes a spawned
+  session's working directory. Found by the new corpus gate on its first run, not by
+  review; it is the `.resolve()` divergence in a second costume.
+
+### Added
+
+- **`npm run gate:corpus`** — a second parity gate, in its own CI step. task-dispatcher
+  owns `tests/fixtures/launch-policy-corpus.json` (27 accept/reject cases) and this
+  plugin fetches it from that repo's `main`, asserting `validateLaunchPolicy()` agrees on
+  every case. `launch-policy.ts` carried a comment saying the Python side "must keep
+  computing this the same way"; this is that comment as a test.
+
+  **Resolved values are compared, not just verdicts.** A verdict-only comparison would
+  have reported the two implementations in agreement throughout both divergences found so
+  far. Like `gate:vocabulary` it has no skip-on-no-network path, and it refuses an empty
+  corpus rather than reporting a vacuous pass.
+
+  It is a separate step from `gate:vocabulary` because it reads a different upstream —
+  one red means "edit `src/vocabulary.ts`", the other means "edit `src/launch-policy.ts`".
+
+- **Pre-launch credential guards (`src/launch-guards.ts`).** A Start of a
+  directly-launched agent is now refused, by name, when `SCOPED_MCP_BEARER_TOKEN` is
+  unresolved or no usable Anthropic credential is available — the two checks
+  task-dispatcher has always made. Previously such a Start spawned a session doomed to
+  401 from every scoped-mcp tool, or to short-circuit to "Not logged in" before reading
+  the prompt; both present to the operator as an agent that started and did nothing.
+
+  The port includes the dispatcher's `load_agent_env`: `/opt/appdata/agents/<agent>/.env`
+  is layered into the child environment, which this plugin never did. That is the
+  substance of the fix. Measured on forge: the CloudCLI process env carries
+  `CLAUDE_CODE_OAUTH_TOKEN` but no `SCOPED_MCP_BEARER_TOKEN`, so a guard checking only
+  `process.env` would have refused every non-run-as Start — correctly, in that those
+  sessions really were starting without scoped-mcp tools, but that is the bug rather than
+  the fix. The environment that is checked is the one the child is spawned with; passing
+  `process.env` on to `spawn` after checking a different object would make the guard
+  decoration.
+
+  **Both checks are skipped for a `run_as_user` agent, deliberately.** Those credentials
+  are not in this process's environment by design — the launcher sources them as the
+  target user and makes the equivalent checks itself. Running them here would fail every
+  launch for the one agent whose isolation is working correctly.
+
+### Tests
+
+151 → 175. Ten mutants covering every new branch were each confirmed to turn the suite (or
+`gate:corpus`) red, including "the run-as short-circuit is removed" and "the run-as path
+reads the agent env file it must not touch".
+
+One of them survived the first run: the agent-name traversal test pointed at a path that
+did not exist, so `readFileSync` threw and the function returned `{}` whether or not the
+name check ran. It asserted the right outcome for the wrong reason. The target file is now
+planted, so removing the guard changes the result rather than the route to it.
+
 ## [0.9.0] - 2026-08-29
 
 Reads the run records both launchers now write, and makes a Start leave a mark on the task

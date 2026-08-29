@@ -12,6 +12,7 @@ import { resolveAllowedPath } from './path-guard.ts';
 import type { DeadLetter, HeadlessRun, HeadlessRunDetail } from './types.ts';
 import { toDeadLetter } from './dead-letters.ts';
 import { isTerminal } from './vocabulary.ts';
+import { preLaunchEnv } from './launch-guards.ts';
 import {
   loadRunRecord,
   outcomeLabel,
@@ -394,6 +395,23 @@ function launchSession(
 
   const { argv, note } = buildLaunchArgv(entry, mode, prompt, claudeBin, queuedMode);
 
+  // Refuse a session that cannot possibly authenticate, and say which credential is
+  // missing — the same two guards task-dispatcher applies, ported in Phase 5.6. Without
+  // them a Start spawns a process that 401s from every scoped-mcp tool, or that
+  // short-circuits to "Not logged in" before reading the prompt; from the operator's side
+  // both look like an agent that started and did nothing.
+  //
+  // This ALSO layers /opt/appdata/agents/<agent>/.env into the child env, which the
+  // dispatcher has always done and this plugin did not. That is the substance of the fix,
+  // not a side effect: the CloudCLI process env has no SCOPED_MCP_BEARER_TOKEN, so
+  // directly-launched sessions were genuinely starting without one.
+  //
+  // Both checks are skipped for a run-as agent, deliberately — see launch-guards.ts.
+  const guard = preLaunchEnv(targetAgent, entry.runAsUser, process.env, {
+    oauthPath: path.join(os.homedir(), '.claude', '.credentials.json'),
+  });
+  if (!guard.ok) return { ok: false, error: guard.error };
+
   // Per-launch log replaces stdio:'ignore' so a failed launch is diagnosable.
   // cwd:projectDir is how Claude Code resolves project config — `--project` is not a valid flag.
   let logFd: number;
@@ -415,7 +433,9 @@ function launchSession(
       // The run identity, so a Langfuse trace can be joined back to the task that paid
       // for it. Same two names the dispatcher uses; a run-as agent gets them from its
       // launcher's flags instead, because sudo scrubs the environment.
-      env: { ...process.env, FORGE_RUN_ID: runId, FORGE_TASK_ID: taskId },
+      // guard.env, not process.env: the environment that was CHECKED must be the one
+      // that is used, or the guard is checking a different process than it protects.
+      env: { ...guard.env, FORGE_RUN_ID: runId, FORGE_TASK_ID: taskId },
     });
 
     child.on('error', (err) => {
