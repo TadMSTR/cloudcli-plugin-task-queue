@@ -2,6 +2,66 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-08-29
+
+Adds a collapsed **Dead letters** section below the task list, and a Requeue button.
+Build `agent-workflow-interop-2026-08` Phase 1; vikunja#557. Pairs with
+`task-queue-mcp` v0.10.0, which is where the queue-side half lives.
+
+`~/.claude/task-queue/dead-letters/` is written by `task-dispatcher` when a task exhausts
+its routing retries. Nothing could show it: the MCP's `get_task` searched the queue root
+then `archive/` and answered `not found`, and this plugin globbed the queue root only.
+Seventeen tasks accumulated there between 2026-05-29 and 2026-07-25 — every one a security
+audit request, all seventeen carrying the identical `failed_reason` (`Invalid or missing
+build_name in payload: 'unknown'`) — and the only notice any of them ever got was a single
+Matrix message at the moment it was dropped.
+
+This does not fix the bug that produced them; that is vikunja#63/#169.
+
+### Added
+- `GET /dead-letters` — read-only, reading `dead-letters/*.yml` directly like every other
+  read here. No new `manifest.json` permission and no new env var.
+- `panels/dead-letters.ts` — a **collapsed** section, not a tab: the healthy count is zero,
+  so a tab would be permanently empty furniture. The heading renders whatever the count is,
+  including `none`, and turns red the moment it is not. The count loads on every refresh
+  rather than on expand — a number that appears only after the operator opens the section
+  is a number nobody sees.
+- `dead-letters.ts` — record shaping and reason-grouping as pure functions, unit-tested.
+  **Grouped by `failed_reason`**: seventeen records with one identical reason are one bug
+  that fired seventeen times, and seventeen sibling rows read as seventeen unrelated
+  problems — roughly how they were treated for three months. Largest group first; newest
+  failure first within a group.
+- **Requeue** button, wired to the new `requeue` control action → `POST /tasks/:id/requeue`
+  on the MCP control API (operator-only there). Confirmed before firing, and the
+  confirmation says the part that matters: requeueing does **not** fix why the task was
+  dropped, so if the cause is still live it will come back.
+- A source-level **drift gate** pinning the `ControlAction` union to `server.ts`'s mutation
+  route regex. The AGENTS.md invariant said these were "three copies of one contract" and
+  nothing checked it: adding an action to the union alone compiles, and the failure mode is
+  a button that 404s against the plugin's own backend. Two of the three copies live in this
+  repo and are now pinned to each other. Verified to fail in both directions.
+
+### Security
+- Audited 2026-08-29 (`agent-workflow-interop-2026-08-phase1`): no findings in this repo.
+  The auditor independently confirmed structurally — not just by test — that
+  `toDeadLetter()` builds its response from an explicit field allowlist and never
+  references `payload`, so `GET /dead-letters` is a strictly narrower surface than the
+  existing `GET /tasks`; and that `renderRow()` escapes every interpolated value while
+  routing `summary` and `reason` through `textContent`.
+
+### Notes
+- A record with no `id` is **skipped**, never rendered — a row that cannot be addressed is
+  a row whose Requeue button could not work.
+- An unparseable failure timestamp renders as `—`, not as an age. `ago()` maps an invalid
+  date to "just now", which on this surface would claim a three-month-old drop happened
+  seconds ago.
+- `created` arrives from js-yaml as a `Date` for every real record (unquoted YAML
+  timestamp), and is serialised rather than string-coerced.
+- The queue watcher still watches the queue root only. `fs.watch` is not recursive on
+  Linux, so a task arriving in `dead-letters/` fires no event — deliberate: the section is
+  collapsed, a dead letter is not live work, and the dispatcher unlinks the original from
+  the root as it dead-letters, which does fire.
+
 ## [0.6.0] - 2026-08-27
 
 Adds a **Headless runs** section below the task list: a read-only view of agent sessions

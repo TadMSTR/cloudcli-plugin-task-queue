@@ -8,7 +8,8 @@ import { load as yamlLoad } from 'js-yaml';
 import { callControlApi, type ControlAction } from './control-api.ts';
 import { evaluateUpgrade, allowedOrigins } from './ws-guard.ts';
 import { resolveAllowedPath } from './path-guard.ts';
-import type { HeadlessRun, HeadlessRunDetail } from './types.ts';
+import type { DeadLetter, HeadlessRun, HeadlessRunDetail } from './types.ts';
+import { toDeadLetter } from './dead-letters.ts';
 import {
   parseLaunchLogName,
   parseRunId,
@@ -33,6 +34,10 @@ import {
 
 const HOME = process.env.HOME ?? os.homedir();
 const TASK_QUEUE_DIR = path.join(HOME, '.claude', 'task-queue');
+// Written by task-dispatcher when a task exhausts its routing retries. Read-only here;
+// the one mutation that touches it (requeue) goes through the MCP control API like every
+// other mutation. See listDeadLetters.
+const DEAD_LETTER_DIR = path.join(TASK_QUEUE_DIR, 'dead-letters');
 const START_TIME = Date.now();
 
 // Read from package.json rather than hardcoding. A hardcoded copy silently drifted
@@ -51,8 +56,8 @@ const VERSION: string = (() => {
 const VALID_ID = /^[a-zA-Z0-9_-]+$/;
 
 // MCP control API — the single validated, shared-secret-gated mutation path. All
-// queue mutations (approve/cancel/status/park/unpark/amend) proxy here so they
-// inherit the MCP core's transition validation + fcntl locking. Reads stay direct.
+// queue mutations (approve/cancel/status/park/unpark/amend/requeue) proxy here so
+// they inherit the MCP core's transition validation + fcntl locking. Reads stay direct.
 const TASK_QUEUE_API = (process.env.TASK_QUEUE_API ?? 'http://127.0.0.1:8485').replace(/\/$/, '');
 const TASK_QUEUE_API_SECRET = process.env.TASK_QUEUE_API_SECRET ?? '';
 
@@ -143,6 +148,39 @@ function getTask(taskId: string): Task | null {
   } catch {
     return null;
   }
+}
+
+// ── Dead letters (read-only) ──────────────────────────────────────────
+
+/**
+ * Every record in dead-letters/, shaped for the UI.
+ *
+ * A missing directory is an empty list, not an error — the healthy state of this queue is
+ * zero, and a plugin that errored when nothing had failed would be broken most of the time.
+ * Records with no `id` are skipped rather than rendered: a row we cannot address is a row
+ * whose Requeue button could not work, and offering one would be a lie.
+ *
+ * This reads YAML directly, like every other read in this file. The single mutation on
+ * these records — requeue — still goes through the control API.
+ */
+function listDeadLetters(): DeadLetter[] {
+  let names: string[];
+  try {
+    names = fs.readdirSync(DEAD_LETTER_DIR);
+  } catch {
+    return [];
+  }
+
+  const letters: DeadLetter[] = [];
+  for (const name of names) {
+    if (!name.endsWith('.yml') || name.endsWith('.tmp')) continue;
+    try {
+      const raw = yamlLoad(fs.readFileSync(path.join(DEAD_LETTER_DIR, name), 'utf-8'));
+      const dl = toDeadLetter((raw ?? {}) as Record<string, unknown>);
+      if (dl) letters.push(dl);
+    } catch { /* skip corrupt file */ }
+  }
+  return letters;
 }
 
 // ── Context ref preview ───────────────────────────────────────────────
@@ -425,6 +463,12 @@ function startWatcher(broadcast: (msg: object) => void): void {
     fs.mkdirSync(TASK_QUEUE_DIR, { recursive: true });
   }
 
+  // The watch is on the queue root only, and fs.watch is not recursive on Linux, so a
+  // task arriving in dead-letters/ fires nothing. That is acceptable and deliberate: a
+  // dead letter is not live work, the section is collapsed by default, and the operator's
+  // refresh (or the next queue-root change, since the dispatcher unlinks the original from
+  // the root as it dead-letters) reloads it. Do not add a recursive watch for this — it
+  // would stream a surface nobody is watching in real time.
   fs.watch(TASK_QUEUE_DIR, { persistent: false }, (_eventType, filename) => {
     if (!filename?.endsWith('.yml')) return;
     if (watchDebounce) clearTimeout(watchDebounce);
@@ -507,6 +551,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // List dead letters. Read-only; grouping happens in the panel via groupByReason.
+    if (pathname === '/dead-letters' && req.method === 'GET') {
+      res.end(JSON.stringify({ deadLetters: listDeadLetters() }));
+      return;
+    }
+
     // List headless runs. Read-only.
     if (pathname === '/headless-runs' && req.method === 'GET') {
       const agent = url.searchParams.get('agent');
@@ -539,7 +589,7 @@ const server = http.createServer(async (req, res) => {
 
     // Queue mutations — all proxied to the MCP control API (the single validated,
     // shared-secret-gated write path). No direct YAML mutation happens in the plugin.
-    const mutationMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)\/(approve|cancel|status|park|unpark|amend)$/);
+    const mutationMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)\/(approve|cancel|status|park|unpark|amend|requeue)$/);
     if (mutationMatch && req.method === 'POST') {
       const mTaskId = mutationMatch[1];
       const action = mutationMatch[2] as ControlAction;
@@ -560,6 +610,7 @@ const server = http.createServer(async (req, res) => {
         } else if (action === 'amend') {
           body = { amendment: parsed.amendment ?? '', reason: parsed.reason ?? '' };
         } else {
+          // cancel / park / unpark / requeue: an optional note, nothing else.
           if (parsed.note) body.note = parsed.note;
           // unpark may name an explicit status to return to.
           if (action === 'unpark' && parsed.status) body.status = parsed.status;
