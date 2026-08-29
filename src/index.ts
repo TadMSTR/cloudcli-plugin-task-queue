@@ -1,10 +1,10 @@
-import type { PluginAPI, PluginContext, Task, ThemeColors, HeadlessRun, HeadlessRunDetail, DeadLetter } from './types.js';
-import { themeColors, injectGlobalStyles, MONO } from './panels/styles.js';
-import { renderTaskList } from './panels/task-list.js';
-import { renderTaskDetail } from './panels/task-detail.js';
-import { renderHeadlessRuns } from './panels/headless-runs.js';
-import { renderDeadLetters } from './panels/dead-letters.js';
-import { createWsClient, WsClient } from './panels/ws-client.js';
+import type { PluginAPI, PluginContext, Task, ThemeColors, HeadlessRun, HeadlessRunDetail, DeadLetter } from './types.ts';
+import { themeColors, injectGlobalStyles, MONO } from './panels/styles.ts';
+import { renderTaskList, type TaskFilters } from './panels/task-list.ts';
+import { renderTaskDetail } from './panels/task-detail.ts';
+import { renderHeadlessRuns } from './panels/headless-runs.ts';
+import { renderDeadLetters } from './panels/dead-letters.ts';
+import { createWsClient, WsClient } from './panels/ws-client.ts';
 
 // ── State ──────────────────────────────────────────────────────────────
 
@@ -16,7 +16,7 @@ interface AppState {
   loading: boolean;
   error: string | null;
   wsConnected: boolean;
-  filters: { agent: string; status: string; taskType: string };
+  filters: TaskFilters;
   headlessRuns: HeadlessRun[];
   selectedRunId: string | null;
   selectedRun: HeadlessRunDetail | null;
@@ -39,7 +39,7 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     loading: true,
     error: null,
     wsConnected: false,
-    filters: { agent: '', status: '', taskType: '' },
+    filters: { agent: '', status: '', taskType: '', mode: '' },
     headlessRuns: [],
     selectedRunId: null,
     selectedRun: null,

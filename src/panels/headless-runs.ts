@@ -1,5 +1,5 @@
-import type { ThemeColors, HeadlessRun, HeadlessRunDetail } from '../types.js';
-import { escHtml, ago, statusColor, MONO } from './styles.js';
+import type { ThemeColors, HeadlessRun, HeadlessRunDetail } from '../types.ts';
+import { escHtml, ago, statusColor, MONO } from './styles.ts';
 
 /**
  * The Headless runs section — a read-only view of agent runs that had no operator

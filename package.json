@@ -1,11 +1,12 @@
 {
   "name": "cloudcli-plugin-task-queue",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "tsc --noEmit && esbuild src/index.ts --bundle --format=esm --outfile=dist/index.js --sourcemap && esbuild src/server.ts --bundle --format=esm --platform=node --outfile=dist/server.js --sourcemap --external:ws",
-    "test": "node --test src/tests/*.test.ts"
+    "test": "node --test src/tests/*.test.ts",
+    "gate:vocabulary": "node src/gates/vocabulary-parity.ts"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",

@@ -1,4 +1,5 @@
-import type { ThemeColors } from '../types.js';
+import type { ThemeColors } from '../types.ts';
+import { STATUS_COLOR } from '../vocabulary.ts';
 
 const MONO = "'JetBrains Mono', 'Fira Code', ui-monospace, monospace";
 
@@ -94,18 +95,19 @@ export function ago(iso: string): string {
   return `${d}d ago`;
 }
 
+/**
+ * Colour for a status. Takes `string`, not `Status` — the callers render whatever the queue
+ * YAML says, including a value written by something newer than this build.
+ *
+ * The mapping itself lives in `vocabulary.ts` as a `Record<Status, …>`, so a status the
+ * plugin knows about but has not been given a colour is a compile error. This used to be a
+ * `switch` with a `default: return c.muted`, which silently absorbed `routing-failed` and
+ * rendered it the same grey as `cancelled` (vikunja#558). The fallback below still exists,
+ * but now it only catches statuses this build has genuinely never heard of.
+ */
 export function statusColor(status: string, c: ThemeColors): string {
-  switch (status) {
-    case 'approved': return c.ok;
-    case 'in-progress': return c.accent;
-    case 'submitted': return c.muted;
-    case 'pending-approval': return c.warn;
-    case 'parked': return c.muted;
-    case 'completed': return c.ok;
-    case 'failed': return c.error;
-    case 'cancelled': return c.muted;
-    default: return c.muted;
-  }
+  const key = (STATUS_COLOR as Record<string, keyof ThemeColors>)[status];
+  return key ? c[key] : c.muted;
 }
 
 export function priorityColor(priority: string, c: ThemeColors): string {

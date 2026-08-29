@@ -1,5 +1,11 @@
-import type { ThemeColors, Task } from '../types.js';
-import { escHtml, ago, statusColor, priorityColor, MONO } from './styles.js';
+import type { ThemeColors, Task } from '../types.ts';
+import { escHtml, ago, statusColor, priorityColor, MONO } from './styles.ts';
+import {
+  NON_TERMINAL_STATUSES,
+  WORKFLOW_MODE_DISPLAY,
+  isTerminal,
+  isWorkflowMode,
+} from '../vocabulary.ts';
 
 interface TaskDetailOptions {
   task: Task;
@@ -21,9 +27,6 @@ interface TaskDetailOptions {
   onOpenRun?: () => void;
 }
 
-const DETAIL_TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
-const DETAIL_NON_TERMINAL_STATUSES = ['submitted', 'pending-approval', 'approved', 'in-progress', 'parked'];
-
 export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions): void {
   const { task, contextPreviews, colors: c, onBack, onApprove, onStart, onCancel, onPark, onUnpark, onAmend, onSetStatus } = opts;
   const isParked = task.status === 'parked';
@@ -31,6 +34,10 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
   const sc = statusColor(task.status, c);
   const priority = task.payload.priority ?? 'normal';
   const pc = priorityColor(priority, c);
+  // Absent on tasks queued before task-queue-mcp wrote the field. Rendered as unknown
+  // rather than as the queue's default — this panel reports what the record says.
+  const mode = task.workflow_mode;
+  const modeDisplay = isWorkflowMode(mode) ? WORKFLOW_MODE_DISPLAY[mode] : null;
 
   const wrapper = document.createElement('div');
   wrapper.className = 'tq-up';
@@ -80,6 +87,12 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
     <span style="color:${c.muted}">Priority</span><span style="color:${pc}">${escHtml(priority)}</span>
     <span style="color:${c.muted}">Risk</span><span>${escHtml(task.risk_level)}</span>
     <span style="color:${c.muted}">Approval</span><span>${task.requires_approval ? 'required' : 'auto'}</span>
+    <span style="color:${c.muted}">Mode</span><span>${
+      modeDisplay
+        ? `<span style="color:${c[modeDisplay.tone]}">${escHtml(mode as string)}</span>`
+          + ` <span style="color:${c.muted};font-size:11px">— ${escHtml(modeDisplay.hint)}</span>`
+        : `<span style="color:${c.muted}">${mode ? escHtml(mode) + ' (not a known mode)' : 'not recorded'}</span>`
+    }</span>
     <span style="color:${c.muted}">Created</span><span>${ago(task.created)} <span style="color:${c.muted}">(${new Date(task.created).toLocaleString()})</span></span>
     <span style="color:${c.muted}">TTL</span><span>${task.ttl_days}d</span>
   `;
@@ -98,7 +111,7 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
   }
   // Lifecycle controls: cancel, park/unpark, and amend — all non-terminal only. Parking a
   // terminal task is meaningless, and amendments to a finished task have no reader.
-  if (!DETAIL_TERMINAL_STATUSES.includes(task.status)) {
+  if (!isTerminal(task.status)) {
     actions.appendChild(makeActionButton('Cancel', c.error, c, () => onCancel(task.id)));
     actions.appendChild(
       isParked
@@ -119,8 +132,35 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
     wrapper.appendChild(banner);
   }
 
+  // Routing-failed banner. The status is written by the dispatcher when it cannot route a
+  // task, and it backs off exponentially before retrying; after the retry budget the task
+  // is dead-lettered. None of that is guessable from the word, and this is the status most
+  // likely to want a human — say what it means and what happens next.
+  if (task.status === 'routing-failed') {
+    const policy = task.retry_policy ?? {};
+    const attempts = typeof policy.retry_count === 'number' ? policy.retry_count : null;
+    // An unparseable timestamp says so, rather than rendering the string "Invalid Date" at
+    // an operator. Same rule as the launch-log birthtime handling: a date we cannot read is
+    // reported as unknown, never dressed up as a real one.
+    const nextAt = policy.next_retry_at ? new Date(policy.next_retry_at) : null;
+    const next = nextAt && !Number.isNaN(nextAt.getTime()) ? nextAt.toLocaleString() : null;
+    const nextUnreadable = !!policy.next_retry_at && next === null;
+    const banner = document.createElement('div');
+    banner.style.cssText = `padding:8px 12px;margin-bottom:16px;font-size:12px;background:${c.surface};border:1px solid ${c.error};border-left-width:3px;border-radius:4px;color:${c.text};`;
+    banner.textContent =
+      'Routing failed — the dispatcher could not hand this to its agent and is backing off. '
+      + (attempts !== null ? `${attempts} retr${attempts === 1 ? 'y' : 'ies'} used. ` : '')
+      + (next
+        ? `Next attempt ${next}. `
+        : nextUnreadable
+          ? 'Its next-attempt time is unreadable. '
+          : 'It will be retried on the next dispatcher pass. ')
+      + 'When the retry budget runs out it is dead-lettered — see the dead-letters section.';
+    wrapper.appendChild(banner);
+  }
+
   // Status-change control — advance a task an agent missed (audited operator override).
-  if (!DETAIL_TERMINAL_STATUSES.includes(task.status)) {
+  if (!isTerminal(task.status)) {
     const statusRow = document.createElement('div');
     statusRow.style.cssText = `display:flex;align-items:center;gap:8px;margin-bottom:16px;`;
 
@@ -134,7 +174,12 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
     placeholder.value = '';
     placeholder.textContent = 'advance to…';
     select.appendChild(placeholder);
-    for (const s of DETAIL_NON_TERMINAL_STATUSES) {
+    // Every non-terminal status, including `routing-failed`. Setting it by hand is not a
+    // dead end: the dispatcher's routing-failed pass picks up any such task whose retry
+    // window has passed, and a record with no `next_retry_at` is eligible immediately — so
+    // this reads as "re-route now, skipping re-approval", which is a thing an operator
+    // wants. The MCP accepts any non-terminal -> non-terminal move on the override path.
+    for (const s of NON_TERMINAL_STATUSES) {
       if (s === task.status) continue;
       const opt = document.createElement('option');
       opt.value = s;

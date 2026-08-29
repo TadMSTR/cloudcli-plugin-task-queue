@@ -2,6 +2,80 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-08-29
+
+Closes the plugin's task-queue vocabulary drift, then gates it so it cannot silently
+reopen. Build `agent-workflow-interop-2026-08` Phase 2; vikunja#558, folding in #543.
+
+### The drift
+
+`task-queue-mcp` made `routing-failed` a first-class non-terminal status and counts it in
+`active` on `GET /queue/summary`. The plugin carried four partial hand-written copies of a
+vocabulary it does not own, and none of them were updated:
+
+| Site | Effect |
+|---|---|
+| `panels/task-list.ts` `STATUS_ORDER` | no entry, fell through `?? 9` — a retrying, failing task sorted **below `cancelled`**, dead last |
+| `panels/task-list.ts` `NON_TERMINAL_STATUSES` | the status filter never offered the value, and the status-change control could not move a task into it |
+| `panels/task-detail.ts` `DETAIL_NON_TERMINAL_STATUSES` | second copy of the same list, stale the same way |
+| `panels/styles.ts` `statusColor` | no `case`, so `default: muted` — identical to `parked` and `cancelled`, i.e. "not urgent" |
+
+The status most in need of an operator was the one that sorted last and looked least
+urgent. `manual-then-auto` (#543) was the same omission one field over.
+
+### Fixed
+
+- **`routing-failed` is a known status everywhere.** It sorts **above `in-progress`** —
+  first in its group — renders in the `error` colour rather than `muted`, is offered by the
+  status filter, and is a valid destination in the operator status-change control. Setting
+  it by hand is not a dead end: the dispatcher's routing-failed pass picks up any such task
+  whose retry window has passed, and a record with no `next_retry_at` is eligible
+  immediately, so it reads as "re-route now, skipping re-approval".
+- **A `routing-failed` task explains itself.** The detail view gains a banner naming what
+  the dispatcher is doing, how many retries are used, when the next attempt is due, and that
+  the end of the budget is a dead letter. The status was previously a bare word.
+- **An unreadable `next_retry_at` says so.** The `routing-failed` banner interpolated
+  `new Date(...).toLocaleString()` directly, so a malformed value in the queue YAML rendered
+  the literal string `Invalid Date` at the operator. Same failure as the launch-log
+  `birthtime` case: a date the code could not read, presented as though it could. Caught by
+  this build's own pre-audit baseline, not by the audit.
+- **A queued `manual-then-auto` survives the Start button.** `toWorkflowMode` collapsed it
+  to `semi-auto`, which re-pins every task the session spawns back to `semi-auto` — the
+  exact failure vikunja#533 added the mode to fix (four security→steward return tasks sat
+  unactioned for over a week). `review` on such a task now passes `manual-then-auto`
+  through; an explicit `auto` Start still overrides. The launch note says which it did.
+
+### Added
+
+- **`src/vocabulary.ts`** — one copy of the queue's statuses, task types and workflow modes,
+  plus the UI maps keyed *by* it. `STATUS_ORDER` and `STATUS_COLOR` are `Record<Status, …>`,
+  so adding a status without a sort position and a colour is now a `tsc` error rather than a
+  silent fallthrough. That is the half the old code lacked: `Record<string, number>` accepts
+  anything and covers nothing.
+- **`npm run gate:vocabulary`** — fetches `task-queue-mcp`'s `main` and asserts the sets
+  match, as its own CI step. Ported from `task-dispatcher`'s `test_task_queue_vocabulary.py`
+  (vikunja#324) with both of the properties that make that one work: **no
+  skip-on-no-network path** — it exits non-zero if it cannot read the upstream, because a
+  check that quietly passes when it could not reach its source of truth is
+  indistinguishable from one that verified something — and it tracks `main`, not a pin, so a
+  vocabulary change merged upstream turns this repo red. That is the alarm, not a
+  malfunction. It also fails rather than reporting a vacuous pass if it parses zero literals.
+  Proven to fire before shipping, in both directions and on all four outcomes.
+- **A Mode filter and a mode badge.** The list can be filtered by `workflow_mode` and the
+  detail view names it with what it means; rows badge `auto` and `manual-then-auto` and stay
+  quiet about `semi-auto`, which is 98% of the queue. A task with no recorded mode renders as
+  unknown, not as the queue's default — older records predate the field and inventing a value
+  the queue never wrote is how this class of bug starts.
+
+### Changed
+
+- The two `NON_TERMINAL_STATUSES` literals are one derived constant
+  (`VALID_STATUSES - TERMINAL_STATUSES`, as upstream derives it). Two copies of one list is
+  how the second went stale.
+- Relative imports now use `.ts`, not `.js`. `node --test` runs the sources directly and
+  does not rewrite a `.js` specifier to the `.ts` file beside it, so the panels — which all
+  used `.js` — were not importable by a test. The first one that needed to be, was not.
+
 ## [0.7.0] - 2026-08-29
 
 Adds a collapsed **Dead letters** section below the task list, and a Requeue button.

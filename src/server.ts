@@ -87,6 +87,9 @@ const LAUNCH_POLICY: { policy: LaunchPolicy | null; error: string | null } = (()
 
 // ── Task operations (direct YAML file reader) ─────────────────────────
 
+// Deliberately looser than the `Task` in types.ts: this parses arbitrary YAML off disk,
+// so every field is optional and unknown keys pass through to the client untouched. The UI
+// side gets the strict shape. Only the fields this file actually reads are named.
 interface Task {
   id?: string;
   task_type?: string;
@@ -94,6 +97,8 @@ interface Task {
   status?: string;
   summary?: string;
   created?: unknown;
+  /** Passed to the launcher on Start so a `manual-then-auto` task keeps its chain. */
+  workflow_mode?: string;
   payload?: Record<string, unknown>;
   [key: string]: unknown;
 }
@@ -230,7 +235,16 @@ function resolveBin(name: string): string | null {
   return null;
 }
 
-function launchSession(taskId: string, targetAgent: string, mode: StartMode): { ok: boolean; error?: string; note?: string } {
+/**
+ * `queuedMode` is the task's own `workflow_mode`, passed through to the launcher. It is
+ * read from the queue record by the caller and never inferred here — see toWorkflowMode.
+ */
+function launchSession(
+  taskId: string,
+  targetAgent: string,
+  mode: StartMode,
+  queuedMode?: string,
+): { ok: boolean; error?: string; note?: string } {
   if (!VALID_ID.test(taskId)) return { ok: false, error: `Invalid task id: ${taskId}` };
 
   if (!LAUNCH_POLICY.policy) {
@@ -269,7 +283,7 @@ function launchSession(taskId: string, targetAgent: string, mode: StartMode): { 
     ? `You have a pending task (id=${taskId}). Read it from task-queue-mcp via get_task. Present a summary of the work entailed. Do NOT begin execution — wait for operator approval.`
     : `You have a pending task (id=${taskId}). Read it from task-queue-mcp via get_task. Claim it (update status to in-progress), then execute the task.`;
 
-  const { argv, note } = buildLaunchArgv(entry, mode, prompt, claudeBin);
+  const { argv, note } = buildLaunchArgv(entry, mode, prompt, claudeBin, queuedMode);
 
   // Per-launch log replaces stdio:'ignore' so a failed launch is diagnosable.
   // cwd:projectDir is how Claude Code resolves project config — `--project` is not a valid flag.
@@ -581,7 +595,12 @@ const server = http.createServer(async (req, res) => {
       const { mode } = JSON.parse(body) as { mode: StartMode };
       const taskData = getTask(startMatch[1]);
       if (!taskData) { res.statusCode = 404; res.end(JSON.stringify({ error: 'task not found' })); return; }
-      const result = launchSession(startMatch[1], taskData.target_agent ?? '', mode ?? 'review');
+      const result = launchSession(
+        startMatch[1],
+        taskData.target_agent ?? '',
+        mode ?? 'review',
+        taskData.workflow_mode,
+      );
       res.statusCode = result.ok ? 200 : 400;
       res.end(JSON.stringify(result));
       return;

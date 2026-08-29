@@ -1,6 +1,6 @@
-import type { ThemeColors, DeadLetter } from '../types.js';
-import { escHtml, ago, MONO } from './styles.js';
-import { groupByReason } from '../dead-letters.js';
+import type { ThemeColors, DeadLetter } from '../types.ts';
+import { escHtml, ago, MONO } from './styles.ts';
+import { groupByReason } from '../dead-letters.ts';
 
 /**
  * The Dead letters section — tasks task-dispatcher gave up routing.
