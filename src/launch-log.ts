@@ -34,9 +34,21 @@ export interface ParsedLaunchLog {
  * a bare task UUID and no agent, and a row with an empty agent is worse than no row.
  */
 const LAUNCH_LOG_RE = /^([a-z][a-z0-9_-]*)-([0-9a-f]{8})\.log$/;
+const RUN_RECORD_RE = /^([a-z][a-z0-9_-]*)-([0-9a-f]{8})\.json$/;
 
 export function parseLaunchLogName(filename: string): ParsedLaunchLog | null {
   const m = LAUNCH_LOG_RE.exec(filename);
+  if (!m) return null;
+  return { agent: m[1], taskId8: m[2] };
+}
+
+/**
+ * The same split for a run record. Two regexes rather than one with an alternating
+ * suffix, so a caller cannot accidentally accept a `.log` where it wanted a `.json` —
+ * the two are listed from one directory and the union is keyed on the shared stem.
+ */
+export function parseRunRecordName(filename: string): ParsedLaunchLog | null {
+  const m = RUN_RECORD_RE.exec(filename);
   if (!m) return null;
   return { agent: m[1], taskId8: m[2] };
 }

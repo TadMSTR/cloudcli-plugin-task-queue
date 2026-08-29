@@ -87,17 +87,56 @@ of final text, and exits. Every such launch already wrote its full stdout to
 26 of these had accumulated with nothing able to show them, and one completed steward run
 stayed invisible for four days.
 
-Each row shows agent, short task id, status, started, duration, and the first line of
-output. Click a row to open the full log.
+Each row shows agent, short task id, status, started, duration, outcome, and the first line
+of output. Click a row to open the full log.
 
 **Status comes from the task queue, not from the log.** A log proves a session ran; it does
 not prove the task closed. The two disagreeing — a finished run whose task is still
-`approved` — is the feature working, not a bug.
+`approved` — is the feature working, not a bug. This holds for the run record too: a record
+saying the run exited 0 never promotes a task's status.
 
-**Duration can be unknown**, rendered as an em dash. It's derived from the log file's
-timestamps, and birthtime is only trusted when it precedes mtime. Every log migrated into
-the shared directory on 2026-08-27 was copied rather than moved, and a copy resets birthtime
-while preserving mtime — so those runs show an unknown duration rather than a wrong one.
+### Run records
+
+Both launchers now write `<agent>-<task8>.json` beside the log. It is a **sibling**, never a
+replacement — the `.log` name is what this plugin's own reader parses and what the
+launch-log retention job matches on.
+
+The list is the **union** of the two artefacts, keyed on the shared `<agent>-<task8>` stem:
+
+- A **log with no record** is one of the 29 runs that predate them. Times still come from
+  the file's mtime, and the outcome column reads `no run record`.
+- A **record with no readable log** is the security-audit launcher, which writes its output
+  to `~/.pm2/logs/security-audit-<build>.log`. That prefix stays outside the preview
+  allowlist deliberately — it covers every PM2 service log on this host, and adding it would
+  make this endpoint a reader of all of them. The row renders anyway and the detail view
+  says where the log is, because dropping it would omit the commonest kind of headless
+  session here.
+
+**The outcome column has three honest states and does not collapse them.**
+
+| Rendered | Means |
+|---|---|
+| `no run record` | Predates run records; nothing is known about how it ended |
+| `running` | A record with no `ended` |
+| `exit 0`, `exit 137` | A real observed exit code — only this plugin's own launches get one |
+| `ended, exit code unknown` | The run ended and the code is unrecoverable |
+| `slot released — still running` | Past the dispatcher's max runtime; its concurrency slot was freed and the process was left alone |
+
+`ended, exit code unknown` is not a gap. A dispatcher tick spawns a detached child and
+exits, so the child is reparented and its status is reaped by init — there is no `waitpid()`
+and no surviving `/proc` entry. This plugin is a long-lived process and *can* observe its own
+children exit, so runs it starts carry a real code. Rendering the unknown case as success
+would be a counter reporting success for something nobody observed succeed.
+
+**Duration can be unknown**, rendered as an em dash. With a record it is `ended - started`,
+and it is unknown while the run is still open — deliberately not "now minus started", which
+would tick upward forever for a session that died an hour ago and has not been reaped.
+Without a record it comes from the log file's timestamps, where birthtime is only trusted
+when it precedes mtime: every log migrated into the shared directory on 2026-08-27 was
+copied rather than moved, and a copy resets birthtime while preserving mtime.
+
+Open runs sort above finished ones. A plain descending compare on `ended` puts them at the
+bottom, under three months of finished runs.
 
 Below the log text, a **Commands** block lists every fenced code block scraped from the
 output, each with a copy button. The extraction is deliberately dumb — no inference about
@@ -161,7 +200,7 @@ The backend exposes a small HTTP API consumed by the UI via `api.rpc()`.
 | `GET` | `/health` | Liveness check; returns `{status, uptime, version}` |
 | `GET` | `/tasks` | List tasks; query params `agent`, `status`, `type` |
 | `GET` | `/tasks/:id` | Task detail plus context-ref previews |
-| `POST` | `/tasks/:id/start` | Launch a session; body `{mode: "review"\|"auto"}` (a local spawn, not a queue mutation) |
+| `POST` | `/tasks/:id/start` | Launch a session; body `{mode: "review"\|"auto"}`. Spawns locally, writes a run record, and records the launch in the task's history |
 | `POST` | `/tasks/:id/approve` | Approve — proxied |
 | `POST` | `/tasks/:id/cancel` | Cancel (terminal); body `{note?}` — proxied |
 | `POST` | `/tasks/:id/status` | Operator status change; body `{status, note?, allow_override?}` — proxied |
@@ -236,10 +275,29 @@ rather than launching.
 > `--permission-mode plan` is not reachable. The UI says so on launch rather than implying a
 > tool gate.
 
-### Launch logs
+### Launch logs and run records
 
 Each launch appends to `~/.claude/comms/artifacts/task-launches/<agent>-<task8>.log`, the
-same shape and directory the reference dispatcher writes, so both are listable together.
+same shape and directory the reference dispatcher writes, so both are listable together, and
+writes `<agent>-<task8>.json` beside it. The session also receives `FORGE_RUN_ID` and
+`FORGE_TASK_ID` in its environment, which is what makes a trace joinable back to its task.
+
+### A Start leaves a mark on the task
+
+Before v0.9.0 a Start made **no queue mutation at all**, so a plugin-started task stayed at
+`approved` until its agent got as far as claiming it — and a session that died before that
+left nothing behind anywhere. That is why one completed steward run was invisible for four
+days.
+
+A Start now appends a history entry through the control API. **The status is deliberately
+unchanged**: the call re-asserts the status the task is already in. Advancing
+`approved` → `in-progress` here is the obvious-looking alternative and it breaks every
+plugin-started session — the agent's own first action is `update_task(in-progress)`, which
+task-queue-mcp permits only *from* `approved`. Doing it for the agent means its claim is
+rejected as an invalid transition.
+
+A failure to record is logged and does not fail the Start: the session is already running by
+then, and reporting the launch as failed would be the bigger lie.
 
 ## Development
 

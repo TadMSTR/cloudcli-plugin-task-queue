@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { load as yamlLoad } from 'js-yaml';
 import { callControlApi, type ControlAction } from './control-api.ts';
@@ -10,6 +11,14 @@ import { evaluateUpgrade, allowedOrigins } from './ws-guard.ts';
 import { resolveAllowedPath } from './path-guard.ts';
 import type { DeadLetter, HeadlessRun, HeadlessRunDetail } from './types.ts';
 import { toDeadLetter } from './dead-letters.ts';
+import { isTerminal } from './vocabulary.ts';
+import {
+  parseRunRecord,
+  outcomeLabel,
+  toHeadlessRunView,
+  compareRuns,
+  type RunRecord,
+} from './run-record.ts';
 import {
   parseLaunchLogName,
   parseRunId,
@@ -18,12 +27,14 @@ import {
   firstLine,
   extractFencedBlocks,
   runTimes,
+  parseRunRecordName,
 } from './launch-log.ts';
 import {
   loadLaunchPolicy,
   policyPath,
   buildLaunchArgv,
   launchLogName,
+  runRecordFileName,
   lookupAgent,
   LaunchPolicyError,
   type LaunchPolicy,
@@ -235,6 +246,95 @@ function resolveBin(name: string): string | null {
   return null;
 }
 
+/** Write a run record beside the launch log. Never throws; a launch is already running. */
+function writeRunRecord(record: RunRecord): void {
+  try {
+    fs.mkdirSync(LAUNCH_LOG_DIR, { recursive: true });
+    const target = path.join(LAUNCH_LOG_DIR, runRecordFileName(record.agent, record.task_id));
+    // Write-then-rename, and the tmp name carries this process's pid: two producers write
+    // this directory (this plugin and the dispatcher), so a bare `.tmp` could collide.
+    const tmp = `${target}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    // A missing record undercounts a concurrency slot; a thrown error here would fail a
+    // Start whose session is already running, which is strictly worse.
+    console.error(`[task-queue] could not write run record for ${record.task_id}: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Stamp a run as ended with the code its child actually returned.
+ *
+ * Re-read and re-written rather than held in memory: the dispatcher's reaper may have
+ * closed the same record in between, and the file is the shared state. If it did, its
+ * `pid-gone` is left alone — a reaper that already gave up on this run has recorded
+ * something true, and overwriting it with a code observed later would be tidier and less
+ * accurate about what was known when.
+ */
+function closeRunRecord(
+  agent: string,
+  taskId: string,
+  code: number | null,
+  signal: NodeJS.Signals | null,
+): void {
+  const target = path.join(LAUNCH_LOG_DIR, runRecordFileName(agent, taskId));
+  try {
+    const existing = parseRunRecord(JSON.parse(fs.readFileSync(target, 'utf-8')));
+    if (!existing || existing.ended !== null) return;
+    existing.ended = new Date().toISOString();
+    // A signalled child has no exit code — `code` is null and `signal` names it. Recorded
+    // as the reason rather than coerced to a number, for the same reason the dispatcher
+    // refuses to invent a zero: 'killed by SIGKILL' and 'exited 0' are different facts.
+    existing.exit_code = code;
+    existing.reaped = signal === null ? 'exited' : `signal:${signal}`;
+    const tmp = `${target}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(existing, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(tmp, target);
+  } catch { /* the record was never written, or is gone — nothing to close */ }
+}
+
+/**
+ * Leave a trace of a Start in the TASK, not only in the launch directory.
+ *
+ * A launch that leaves no mark on the task is why a completed steward run sat invisible
+ * for four days: the plugin's Start button made no queue mutation at all, so a
+ * plugin-started task stayed at `approved` until its agent got as far as claiming it —
+ * and a session that died before that left nothing behind anywhere.
+ *
+ * THE STATUS IS DELIBERATELY UNCHANGED — the call re-asserts the status the task is
+ * already in. It is tempting to advance `approved` → `in-progress` here, and it would
+ * break every plugin-started session: the agent's own first action is
+ * update_task(in-progress), which task-queue-mcp permits only FROM `approved`. Doing it
+ * for the agent means its claim is refused as an invalid transition.
+ *
+ * A same-status move needs `allow_override` plus a note, both of which this passes; the
+ * handler appends the history entry and the assignment is a no-op. Best-effort: a
+ * failure here is logged and does not fail the Start, because the session is already
+ * running by this point and reporting the launch as failed would be the bigger lie.
+ */
+async function recordStartInQueue(
+  taskId: string,
+  taskData: Record<string, unknown>,
+  mode: StartMode,
+): Promise<void> {
+  const current = typeof taskData.status === 'string' ? taskData.status : '';
+  // Terminal and unknown statuses are refused by the handler anyway; not asking is
+  // quieter than asking and logging a rejection on every Start of a closed task.
+  if (!current || isTerminal(current)) return;
+  const { status, data } = await callControlApi(taskId, 'status', {
+    status: current,
+    allow_override: true,
+    note: `Session launched from CloudCLI in ${mode} mode`,
+  }, { apiBase: TASK_QUEUE_API, secret: TASK_QUEUE_API_SECRET });
+  if (status !== 200) {
+    console.error(
+      `[task-queue] launched ${taskId} but could not record it in the task's history: `
+      + `${status} ${JSON.stringify(data)}`,
+    );
+  }
+}
+
 /**
  * `queuedMode` is the task's own `workflow_mode`, passed through to the launcher. It is
  * read from the queue record by the caller and never inferred here — see toWorkflowMode.
@@ -297,15 +397,54 @@ function launchSession(
     return { ok: false, error: `Cannot open launch log: ${(err as Error).message}` };
   }
 
+  const runId = randomUUID();
   try {
     const child = spawn(argv[0], argv.slice(1), {
       cwd: entry.projectDir,
       stdio: ['ignore', logFd, logFd],
       detached: true,
+      // The run identity, so a Langfuse trace can be joined back to the task that paid
+      // for it. Same two names the dispatcher uses; a run-as agent gets them from its
+      // launcher's flags instead, because sudo scrubs the environment.
+      env: { ...process.env, FORGE_RUN_ID: runId, FORGE_TASK_ID: taskId },
     });
 
     child.on('error', (err) => {
       try { fs.appendFileSync(logPath, `[launch error] ${err.message}\n`); } catch { /* best-effort */ }
+    });
+
+    // WRITTEN AFTER spawn, because the record's purpose is to carry a pid. A record
+    // written first would have to carry a null one, which every reader treats as a dead
+    // run — so the dispatcher's reaper would sweep the task to `failed` moments after
+    // the session started successfully.
+    writeRunRecord({
+      run_id: runId,
+      task_id: taskId,
+      agent: targetAgent,
+      launched_by: 'plugin',
+      run_as_user: entry.runAsUser ?? null,
+      launcher: entry.launcher ?? null,
+      workflow_mode: queuedMode ?? 'unknown',
+      started: new Date().toISOString(),
+      pid: child.pid ?? null,
+      ended: null,
+      exit_code: null,
+      reaped: null,
+      log_path: logPath,
+    });
+
+    // THIS PLUGIN CAN DO WHAT THE DISPATCHER CANNOT. It is a long-lived process, so the
+    // handle outlives the child and 'exit' still fires after unref() — unref only drops
+    // the event-loop reference, and the HTTP server keeps the loop alive regardless. So
+    // runs started here carry a REAL exit code, where a dispatcher-launched run can only
+    // ever be reaped as `pid-gone`.
+    //
+    // If CloudCLI restarts before the child ends, this never fires and the record stays
+    // open. That is not a leak: the dispatcher's reaper closes it on the next tick, with
+    // the honest `pid-gone` and a null code. The two mechanisms are complementary and
+    // neither invents an outcome.
+    child.on('exit', (code, signal) => {
+      closeRunRecord(targetAgent, taskId, code, signal);
     });
 
     child.unref();
@@ -378,48 +517,93 @@ function readHead(filePath: string, bytes: number): string {
   }
 }
 
-function listHeadlessRuns(agentFilter?: string): HeadlessRun[] {
+/**
+ * Read the run record for a stem, if there is one and it is readable from here.
+ *
+ * The path guard runs on records exactly as it does on logs. A record is JSON this
+ * process parses and copies into an API response, so a symlink planted in the launch
+ * directory would otherwise put an arbitrary file's contents in front of the operator.
+ */
+function readRunRecordFor(agent: string, taskId8: string): RunRecord | null {
+  const resolved = resolveAllowedPath(
+    path.join(LAUNCH_LOG_DIR, `${agent}-${taskId8}.json`),
+    PREVIEW_ALLOWED_PREFIXES,
+  );
+  if (!resolved) return null;
+  try {
+    return parseRunRecord(JSON.parse(fs.readFileSync(resolved, 'utf-8')));
+  } catch {
+    return null;   // absent or corrupt: fall back to the mtime derivation
+  }
+}
+
+/**
+ * Every `<agent>-<task8>` stem in the launch directory, from EITHER artefact.
+ *
+ * The union matters in one direction that is not hypothetical: the security-audit
+ * launcher writes its record here and its log to ~/.pm2/logs, so keying the list on
+ * `.log` files alone would omit the commonest kind of headless session on this host.
+ * Listing only `.json` would drop the other 29 the other way — those predate run records.
+ */
+function launchStems(): Map<string, { agent: string; taskId8: string }> {
+  const stems = new Map<string, { agent: string; taskId8: string }>();
   let names: string[];
   try {
     names = fs.readdirSync(LAUNCH_LOG_DIR);
   } catch {
-    return [];   // directory absent is an empty list, not an error
+    return stems;   // directory absent is an empty list, not an error
   }
+  for (const name of names) {
+    // Skip anything matching neither shape rather than guessing at an agent. Two
+    // pre-2026-08 orphans are named with a bare task UUID and no agent at all.
+    const parsed = parseLaunchLogName(name) ?? parseRunRecordName(name);
+    if (!parsed) continue;
+    stems.set(runId(parsed.agent, parsed.taskId8), parsed);
+  }
+  return stems;
+}
 
+function listHeadlessRuns(agentFilter?: string): HeadlessRun[] {
   const queue = queueIndexByPrefix();
   const runs: HeadlessRun[] = [];
 
-  for (const name of names) {
-    // Skip anything that is not <agent>-<task8>.log rather than guessing at an agent.
-    // Two pre-2026-08 orphans are named with a bare task UUID and no agent.
-    const parsed = parseLaunchLogName(name);
-    if (!parsed) continue;
+  for (const parsed of launchStems().values()) {
     if (agentFilter && parsed.agent !== agentFilter) continue;
+
+    const record = readRunRecordFor(parsed.agent, parsed.taskId8);
 
     // The guard runs on the LIST route too, not only on the detail route: this loop
     // head-reads every file, so a symlink planted in the log dir would otherwise put
     // the first line of its target into a row.
-    const resolved = resolveAllowedPath(path.join(LAUNCH_LOG_DIR, name), PREVIEW_ALLOWED_PREFIXES);
-    if (!resolved) continue;
+    const resolved = resolveAllowedPath(
+      path.join(LAUNCH_LOG_DIR, launchLogName(parsed.agent, parsed.taskId8)),
+      PREVIEW_ALLOWED_PREFIXES,
+    );
+    let st: fs.Stats | null = null;
+    if (resolved) {
+      try {
+        const stat = fs.statSync(resolved);
+        if (stat.isFile()) st = stat;
+      } catch { /* record with no co-located log — the audit launcher's shape */ }
+    }
+    // A stem with neither a readable log nor a record is nothing to show.
+    if (!st && !record) continue;
 
-    let st: fs.Stats;
-    try { st = fs.statSync(resolved); } catch { continue; }
-    if (!st.isFile()) continue;
-
-    const match = queue.get(parsed.taskId8);
-    runs.push({
-      id: runId(parsed.agent, parsed.taskId8),
+    // Everything below the read is toHeadlessRunView's, in run-record.ts, so the merge
+    // decisions are unit-testable — this function can only be exercised by booting a
+    // listener. It does the reading; that does the deciding.
+    runs.push(toHeadlessRunView({
       agent: parsed.agent,
-      task_id8: parsed.taskId8,
-      task_id: match?.taskId ?? null,
-      status: match?.status ?? 'unknown',
-      size: st.size,
-      first_line: firstLine(readHead(resolved, HEADLESS_HEAD_BYTES)),
-      ...runTimes(st),
-    });
+      taskId8: parsed.taskId8,
+      record,
+      fileTimes: st ? runTimes(st) : null,
+      logSize: st?.size ?? 0,
+      firstLine: st && resolved ? firstLine(readHead(resolved, HEADLESS_HEAD_BYTES)) : '',
+      queue: queue.get(parsed.taskId8),
+    }));
   }
 
-  runs.sort((a, b) => b.ended.localeCompare(a.ended));
+  runs.sort(compareRuns);
   return runs;
 }
 
@@ -430,40 +614,59 @@ function readHeadlessRun(id: string): HeadlessRunDetail | null {
   const parsed = parseRunId(id);
   if (!parsed) return null;
 
+  const record = readRunRecordFor(parsed.agent, parsed.taskId8);
+
   const resolved = resolveAllowedPath(
     path.join(LAUNCH_LOG_DIR, runIdToFilename(parsed)),
     PREVIEW_ALLOWED_PREFIXES,
   );
-  if (!resolved) return null;
 
-  let text: string;
-  let truncated: boolean;
+  let text = '';
+  let truncated = false;
+  let logReadable = false;
   let fd: number | null = null;
-  try {
-    const st = fs.statSync(resolved);
-    if (!st.isFile()) return null;
-    fd = fs.openSync(resolved, 'r');
-    // Read one byte past the cap so a file exactly at the cap is not called truncated.
-    const buf = Buffer.alloc(HEADLESS_MAX_BYTES + 1);
-    const n = fs.readSync(fd, buf, 0, HEADLESS_MAX_BYTES + 1, 0);
-    truncated = n > HEADLESS_MAX_BYTES;
-    text = buf.subarray(0, Math.min(n, HEADLESS_MAX_BYTES)).toString('utf-8');
-  } catch {
-    return null;
-  } finally {
-    if (fd !== null) { try { fs.closeSync(fd); } catch { /* already gone */ } }
+  if (resolved) {
+    try {
+      const st = fs.statSync(resolved);
+      if (st.isFile()) {
+        fd = fs.openSync(resolved, 'r');
+        // Read one byte past the cap so a file exactly at the cap is not called truncated.
+        const buf = Buffer.alloc(HEADLESS_MAX_BYTES + 1);
+        const n = fs.readSync(fd, buf, 0, HEADLESS_MAX_BYTES + 1, 0);
+        truncated = n > HEADLESS_MAX_BYTES;
+        text = buf.subarray(0, Math.min(n, HEADLESS_MAX_BYTES)).toString('utf-8');
+        logReadable = true;
+      }
+    } catch { /* falls through to the record-only rendering below */ }
+    finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* already gone */ } }
+    }
   }
+
+  // An unreadable log is only a 404 when there is no record either. With a record, the
+  // run is a real thing the operator asked about and the honest answer is its metadata
+  // plus where the output actually is — the security-audit launcher writes to
+  // ~/.pm2/logs, which stays outside the preview allowlist deliberately: that prefix
+  // covers every PM2 service log on the host, and adding it would make this endpoint a
+  // reader of all of them.
+  if (!logReadable && !record) return null;
 
   const match = queueIndexByPrefix().get(parsed.taskId8);
   return {
     id: runId(parsed.agent, parsed.taskId8),
     agent: parsed.agent,
     task_id8: parsed.taskId8,
-    task_id: match?.taskId ?? null,
+    task_id: match?.taskId ?? record?.task_id ?? null,
     status: match?.status ?? 'unknown',
     text,
     commands: extractFencedBlocks(text),
     truncated,
+    has_record: record !== null,
+    launched_by: record?.launched_by ?? null,
+    outcome: record ? outcomeLabel(record) : null,
+    exit_code: record?.exit_code ?? null,
+    log_path: record?.log_path ?? null,
+    log_readable: logReadable,
   };
 }
 
@@ -601,6 +804,7 @@ const server = http.createServer(async (req, res) => {
         mode ?? 'review',
         taskData.workflow_mode,
       );
+      if (result.ok) await recordStartInQueue(startMatch[1], taskData, mode ?? 'review');
       res.statusCode = result.ok ? 200 : 400;
       res.end(JSON.stringify(result));
       return;

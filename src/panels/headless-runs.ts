@@ -22,6 +22,30 @@ interface HeadlessRunsOptions {
   onCopy: (text: string) => void;
 }
 
+/**
+ * The outcome column. Three distinct states, never collapsed:
+ *
+ *   ''                          no run record — this run predates them; nothing is known
+ *   'running'                   a record with no `ended`
+ *   run.outcome                 'exit 0' | 'exit 137' | 'ended, exit code unknown' | …
+ *
+ * The middle phrase of the third is the one that must survive review. Rendering an
+ * unrecoverable exit code as "ok" is exactly the counter-reporting-success failure the
+ * run record was added to expose.
+ */
+function outcomeText(run: Pick<HeadlessRun, 'has_record' | 'outcome'>): string {
+  if (!run.has_record) return 'no run record';
+  return run.outcome ?? 'running';
+}
+
+function outcomeColor(run: HeadlessRun, c: ThemeColors): string {
+  if (!run.has_record) return c.muted;
+  if (run.outcome === null) return c.accent;             // still running
+  if (run.exit_code === 0) return c.muted;               // ordinary success, not shouted
+  if (run.exit_code !== null) return c.warn;             // a real non-zero code
+  return c.muted;                                        // honestly unknown
+}
+
 function formatDuration(seconds: number | null): string {
   // An unknown duration reads as unknown. Rendering it as 0s would claim the run was
   // instantaneous, which is a different and false statement.
@@ -57,7 +81,9 @@ export function renderHeadlessRuns(parent: HTMLElement, opts: HeadlessRunsOption
   blurb.textContent =
     'Agent sessions launched without an operator watching. Each one wrote its final '
     + 'output to a log; this is that output. Status comes from the task queue, not from '
-    + 'the log — a finished run whose task is still open is worth noticing.';
+    + 'the log — a finished run whose task is still open is worth noticing. Outcome comes '
+    + 'from the run record, and "exit code unknown" is a real answer: a dispatcher tick '
+    + 'does not outlive the session it starts, so there is no code left to read.';
   section.appendChild(blurb);
 
   if (opts.selectedRunId && opts.selectedRun) {
@@ -139,6 +165,7 @@ function renderRow(run: HeadlessRun, opts: HeadlessRunsOptions): HTMLElement {
     <span style="color:${statusColor(run.status, c)};min-width:96px">${escHtml(run.status)}</span>
     <span style="color:${c.muted};min-width:64px">${escHtml(ago(run.started))}</span>
     <span style="color:${c.muted};min-width:56px">${escHtml(formatDuration(run.duration_s))}</span>
+    <span style="color:${outcomeColor(run, c)};min-width:150px">${escHtml(outcomeText(run))}</span>
   `;
 
   // The first line is agent stdout. textContent, never innerHTML.
@@ -169,8 +196,23 @@ function renderDetail(section: HTMLElement, opts: HeadlessRunsOptions): void {
     <span style="color:${c.accent};font-weight:600">${escHtml(run.agent)}</span>
     <span style="color:${c.muted}">${escHtml(run.task_id ?? run.task_id8)}</span>
     <span style="color:${statusColor(run.status, c)}">${escHtml(run.status)}</span>
+    <span style="color:${c.muted}">${escHtml(outcomeText(run))}</span>
+    ${run.launched_by ? `<span style="color:${c.muted}">via ${escHtml(run.launched_by)}</span>` : ''}
   `;
   section.appendChild(meta);
+
+  // A run whose log this UI may not read still renders — it is a real run the operator
+  // asked about. Saying where the output is beats an empty pane or a 404.
+  if (!run.log_readable) {
+    const note = document.createElement('div');
+    note.style.cssText = `color:${c.warn};font-size:11px;margin-bottom:10px;padding:10px;`
+      + `background:${c.surface};border:1px solid ${c.border};border-radius:4px;line-height:1.5;`;
+    note.textContent = run.log_path
+      ? `This run's output is not readable from here. It is at: ${run.log_path}`
+      : 'This run left no readable log in the launch directory.';
+    section.appendChild(note);
+    return;
+  }
 
   // ── Commands ──
   // Omitted entirely when there are none, rather than rendered as an empty header.

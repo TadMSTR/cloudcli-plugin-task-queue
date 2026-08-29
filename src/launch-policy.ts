@@ -260,3 +260,12 @@ export function buildLaunchArgv(
 export function launchLogName(agent: string, taskId: string): string {
   return `${agent}-${taskId.slice(0, 8)}.log`;
 }
+
+/**
+ * Run-record filename — the log's stem with a `.json` suffix. Also shared with
+ * task-dispatcher (run_record_name()). Defined here rather than in run-record.ts so the
+ * two names that must agree sit next to each other; splitting them is how the stem drifts.
+ */
+export function runRecordFileName(agent: string, taskId: string): string {
+  return `${agent}-${taskId.slice(0, 8)}.json`;
+}

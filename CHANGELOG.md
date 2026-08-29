@@ -2,6 +2,71 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-08-29
+
+Reads the run records both launchers now write, and makes a Start leave a mark on the task
+it started.
+
+Tracker: vikunja#559. Build plan: agent-workflow-interop-2026-08, Phase 3.
+
+### Added
+
+- **A run record beside every launch this plugin starts.**
+  `~/.claude/comms/artifacts/task-launches/<agent>-<task8>.json`, the same shape
+  `task-dispatcher` v1.3.0 writes. A **sibling** of the log, never a replacement: the
+  `.log` name is what this plugin's own reader parses and what the launch-log retention
+  job matches on.
+- **A real exit code for runs this plugin starts.** It is a long-lived process, so the
+  child handle outlives the spawn and `'exit'` still fires after `unref()`. A
+  dispatcher-launched run can only ever be reaped as `pid-gone` with a null code; this one
+  records what the process actually returned, and a signalled child records the signal
+  rather than a coerced number.
+- **`FORGE_RUN_ID` / `FORGE_TASK_ID` in the launched session's environment**, so a trace
+  can be joined back to the task that paid for it.
+- **An outcome column**, with three states kept distinct: `no run record`, `running`,
+  and the run's actual outcome — `exit 0`, `exit 137`, `ended, exit code unknown`, or
+  `slot released — still running`. `ended, exit code unknown` is the honest rendering of a
+  dispatcher launch and is deliberately not collapsed into success.
+- **The list is now the union of logs and records.** A record with no co-located log
+  renders too — that is the security-audit launcher, whose output goes to `~/.pm2/logs`.
+  That prefix stays outside the preview allowlist because it covers every PM2 service log
+  on this host, so the detail view says where the log is rather than the row being dropped.
+  Dropping it would have omitted the commonest kind of headless session here.
+- **Open runs sort above finished ones.** A descending compare on `ended` put them at the
+  bottom, under three months of finished runs.
+
+### Fixed
+
+- **A Start made no queue mutation at all.** A plugin-started task stayed at `approved`
+  until its agent got as far as claiming it, and a session that died before that left
+  nothing behind anywhere — which is why one completed steward run was invisible for four
+  days (vikunja#534).
+
+  A Start now appends a history entry through the control API. **The status is
+  deliberately unchanged** — the call re-asserts the status the task is already in.
+  Advancing `approved` → `in-progress` is the obvious-looking alternative and it breaks
+  every plugin-started session: the agent's own first action is
+  `update_task(in-progress)`, which task-queue-mcp permits only *from* `approved`.
+- **Duration for a still-open run is unknown, not a growing number.** It would otherwise
+  be derived from the log's mtime and tick upward on every poll for a session that in fact
+  died an hour ago and has not been reaped.
+
+### Changed
+
+- **`src/run-record.ts` added** — the parser for what both launchers write, plus the merge
+  that turns (record, log stat, queue match) into one list row. Extracted from `server.ts`
+  for the reason every other module here was: `server.ts` listens at import time, so
+  nothing inside it can be unit-tested, and the merge is where the decisions are.
+- `runRecordFileName` sits beside `launchLogName` in `launch-policy.ts`, pinned to it by a
+  round-trip test. If the two stems disagree, one run renders as two rows.
+
+### Unchanged, deliberately
+
+- **Status still comes from the queue and only from the queue.** A record saying a run
+  exited 0 does not promote its task's status. A finished run whose task is still
+  `approved` is the disagreement this panel exists to show.
+- **The `<agent>-<task8>.log` filename.** Two other consumers key on it.
+
 ## [0.8.0] - 2026-08-29
 
 Closes the plugin's task-queue vocabulary drift, then gates it so it cannot silently
