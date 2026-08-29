@@ -126,6 +126,16 @@ function upstreamSets(source: string, origin: string): Map<string, string[]> {
 
 async function fetchUpstream(): Promise<string> {
   try {
+    // SECURITY[accepted]: no `redirect: "manual"`, deviating from baseline pattern SSRF-02.
+    // The URL is not caller-supplied — host and path are literals, only the ref segment
+    // varies, and it is charset-checked and `..`-rejected above. The response is never
+    // executed: python-sets.ts accepts only a brace-delimited list of plain string literals.
+    // Worst case from a hostile redirect is a false red (loud, blocks CI) or a false green
+    // requiring the attacker to serve the exact correct value sets, which achieves nothing.
+    // Following redirects beats breaking the gate if GitHub ever 302s this path. Reviewed
+    // and accepted 2026-08-29 — agent-workflow-interop-2026-08-phase2 audit, INFO 1; row in
+    // host-forge-knowledge-base/security/accepted-risks.md. Revisit if this is ever made to
+    // accept a caller-supplied URL or host.
     const resp = await fetch(UPSTREAM_URL, { signal: AbortSignal.timeout(30_000) });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     return await resp.text();

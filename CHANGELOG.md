@@ -34,6 +34,11 @@ urgent. `manual-then-auto` (#543) was the same omission one field over.
 - **A `routing-failed` task explains itself.** The detail view gains a banner naming what
   the dispatcher is doing, how many retries are used, when the next attempt is due, and that
   the end of the budget is a dead letter. The status was previously a bare word.
+- **An unreadable `next_retry_at` says so.** The `routing-failed` banner interpolated
+  `new Date(...).toLocaleString()` directly, so a malformed value in the queue YAML rendered
+  the literal string `Invalid Date` at the operator. Same failure as the launch-log
+  `birthtime` case: a date the code could not read, presented as though it could. Caught by
+  this build's own pre-audit baseline, not by the audit.
 - **A queued `manual-then-auto` survives the Start button.** `toWorkflowMode` collapsed it
   to `semi-auto`, which re-pins every task the session spawns back to `semi-auto` — the
   exact failure vikunja#533 added the mode to fix (four security→steward return tasks sat
