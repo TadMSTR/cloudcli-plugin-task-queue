@@ -41,6 +41,14 @@ This does not fix the bug that produced them; that is vikunja#63/#169.
   a button that 404s against the plugin's own backend. Two of the three copies live in this
   repo and are now pinned to each other. Verified to fail in both directions.
 
+### Security
+- Audited 2026-08-29 (`agent-workflow-interop-2026-08-phase1`): no findings in this repo.
+  The auditor independently confirmed structurally — not just by test — that
+  `toDeadLetter()` builds its response from an explicit field allowlist and never
+  references `payload`, so `GET /dead-letters` is a strictly narrower surface than the
+  existing `GET /tasks`; and that `renderRow()` escapes every interpolated value while
+  routing `summary` and `reason` through `textContent`.
+
 ### Notes
 - A record with no `id` is **skipped**, never rendered — a row that cannot be addressed is
   a row whose Requeue button could not work.
