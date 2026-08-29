@@ -278,7 +278,15 @@ function closeRunRecord(
   code: number | null,
   signal: NodeJS.Signals | null,
 ): void {
-  const target = path.join(LAUNCH_LOG_DIR, runRecordFileName(agent, taskId));
+  // Through the path guard, like every other read here. This one's content is not
+  // surfaced anywhere, which is exactly why it would be the copy that gets forgotten —
+  // and the list route's guard exists because a real ~/.secrets symlink was planted in
+  // this directory and read. One rule, every reader.
+  const target = resolveAllowedPath(
+    path.join(LAUNCH_LOG_DIR, runRecordFileName(agent, taskId)),
+    PREVIEW_ALLOWED_PREFIXES,
+  );
+  if (!target) return;
   try {
     const existing = parseRunRecord(JSON.parse(fs.readFileSync(target, 'utf-8')));
     if (!existing || existing.ended !== null) return;
