@@ -139,13 +139,22 @@ export function renderTaskDetail(container: HTMLElement, opts: TaskDetailOptions
   if (task.status === 'routing-failed') {
     const policy = task.retry_policy ?? {};
     const attempts = typeof policy.retry_count === 'number' ? policy.retry_count : null;
-    const next = policy.next_retry_at;
+    // An unparseable timestamp says so, rather than rendering the string "Invalid Date" at
+    // an operator. Same rule as the launch-log birthtime handling: a date we cannot read is
+    // reported as unknown, never dressed up as a real one.
+    const nextAt = policy.next_retry_at ? new Date(policy.next_retry_at) : null;
+    const next = nextAt && !Number.isNaN(nextAt.getTime()) ? nextAt.toLocaleString() : null;
+    const nextUnreadable = !!policy.next_retry_at && next === null;
     const banner = document.createElement('div');
     banner.style.cssText = `padding:8px 12px;margin-bottom:16px;font-size:12px;background:${c.surface};border:1px solid ${c.error};border-left-width:3px;border-radius:4px;color:${c.text};`;
     banner.textContent =
       'Routing failed — the dispatcher could not hand this to its agent and is backing off. '
       + (attempts !== null ? `${attempts} retr${attempts === 1 ? 'y' : 'ies'} used. ` : '')
-      + (next ? `Next attempt ${new Date(next).toLocaleString()}. ` : 'It will be retried on the next dispatcher pass. ')
+      + (next
+        ? `Next attempt ${next}. `
+        : nextUnreadable
+          ? 'Its next-attempt time is unreadable. '
+          : 'It will be retried on the next dispatcher pass. ')
       + 'When the retry budget runs out it is dead-lettered — see the dead-letters section.';
     wrapper.appendChild(banner);
   }
