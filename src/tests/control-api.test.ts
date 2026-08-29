@@ -138,3 +138,78 @@ test('an authorization rejection from the control API passes through unmodified'
   assert.equal(result.status, 400);
   assert.match((result.data as { error: string }).error, /may not amend/);
 });
+
+// ── requeue ───────────────────────────────────────────────────────────
+
+test('requeue posts to the requeue route as operator', async () => {
+  const fetchSpy = spyFetch(200, { ok: true, task_id: 'x', requeued_from: 'dead-letters' });
+  const result = await callControlApi('task-abc', 'requeue', { note: 'Requeued via CloudCLI' }, {
+    apiBase: 'http://127.0.0.1:8485',
+    secret: 'synthetic-not-a-real-secret',
+    fetchImpl: fetchSpy.impl,
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(fetchSpy.calls[0].url, 'http://127.0.0.1:8485/tasks/task-abc/requeue');
+  assert.deepEqual(JSON.parse(fetchSpy.calls[0].init.body as string), {
+    actor: 'operator',
+    note: 'Requeued via CloudCLI',
+  });
+});
+
+test('requeue fails closed without the secret, like every other mutation', async () => {
+  // Requeue puts work back in front of an agent. It must not be the one action that
+  // slipped past the gate.
+  const fetchSpy = spyFetch();
+  const result = await callControlApi('task-abc', 'requeue', {}, {
+    apiBase: 'http://127.0.0.1:8485',
+    secret: '',
+    fetchImpl: fetchSpy.impl,
+  });
+
+  assert.equal(result.status, 500);
+  assert.equal(fetchSpy.calls.length, 0);
+});
+
+test("the MCP's 404 for a non-dead-lettered task passes through unchanged", async () => {
+  // The MCP scopes requeue to dead-letters/ alone; a `failed` task in the live queue is a
+  // 404 there. The plugin must surface that, not translate it into a success.
+  const fetchSpy = spyFetch(404, { ok: false, error: 'not found' });
+  const result = await callControlApi('task-abc', 'requeue', {}, {
+    apiBase: 'http://127.0.0.1:8485',
+    secret: 'synthetic-not-a-real-secret',
+    fetchImpl: fetchSpy.impl,
+  });
+
+  assert.equal(result.status, 404);
+  assert.deepEqual(result.data, { ok: false, error: 'not found' });
+});
+
+// ── the three-copies contract ─────────────────────────────────────────
+
+test('the ControlAction union and the server route regex name the same actions', async () => {
+  // AGENTS.md: "ControlAction must match the MCP's route set. The union type in
+  // control-api.ts, the route regex in server.ts, and the MCP's custom routes are three
+  // copies of one contract."
+  //
+  // Two of those three are in this repo and can be pinned to each other here. Nothing
+  // detected the drift before: adding an action to the union alone compiles, and adding it
+  // to the regex alone type-errors only if a literal is passed — the failure mode is a
+  // button that 404s in the plugin's own backend.
+  const fs = await import('node:fs');
+  const url = await import('node:url');
+
+  const read = (rel: string) =>
+    fs.readFileSync(url.fileURLToPath(new URL(rel, import.meta.url)), 'utf-8');
+
+  const union = read('../control-api.ts').match(/export type ControlAction =([\s\S]*?);/);
+  assert.ok(union, 'ControlAction union not found — has it been renamed?');
+  const unionActions = [...union[1].matchAll(/'([a-z-]+)'/g)].map(m => m[1]).sort();
+
+  const regex = read('../server.ts').match(/\\\/\(([a-z|]+)\)\$/);
+  assert.ok(regex, 'mutation route regex not found in server.ts — has it been rewritten?');
+  const routeActions = regex[1].split('|').sort();
+
+  assert.deepEqual(routeActions, unionActions);
+  assert.ok(unionActions.includes('requeue'), 'the fixture itself must be non-trivial');
+});

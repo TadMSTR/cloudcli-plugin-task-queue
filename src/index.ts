@@ -1,8 +1,9 @@
-import type { PluginAPI, PluginContext, Task, ThemeColors, HeadlessRun, HeadlessRunDetail } from './types.js';
+import type { PluginAPI, PluginContext, Task, ThemeColors, HeadlessRun, HeadlessRunDetail, DeadLetter } from './types.js';
 import { themeColors, injectGlobalStyles, MONO } from './panels/styles.js';
 import { renderTaskList } from './panels/task-list.js';
 import { renderTaskDetail } from './panels/task-detail.js';
 import { renderHeadlessRuns } from './panels/headless-runs.js';
+import { renderDeadLetters } from './panels/dead-letters.js';
 import { createWsClient, WsClient } from './panels/ws-client.js';
 
 // ── State ──────────────────────────────────────────────────────────────
@@ -20,6 +21,9 @@ interface AppState {
   selectedRunId: string | null;
   selectedRun: HeadlessRunDetail | null;
   runAgentFilter: string;
+  deadLetters: DeadLetter[];
+  /** Collapsed by default — the healthy count is zero. */
+  deadLettersExpanded: boolean;
 }
 
 // ── Mount ──────────────────────────────────────────────────────────────
@@ -40,6 +44,8 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     selectedRunId: null,
     selectedRun: null,
     runAgentFilter: '',
+    deadLetters: [],
+    deadLettersExpanded: false,
   };
 
   let wsClient: WsClient | null = null;
@@ -89,6 +95,7 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
       state.error = (err as Error).message;
     }
     await loadHeadlessRuns();
+    await loadDeadLetters();
     state.loading = false;
     render(api.context);
   }
@@ -107,6 +114,19 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     } catch {
       // A failure here must not blank the task list — the runs section is secondary.
       state.headlessRuns = [];
+    }
+  }
+
+  // Loaded on every refresh, not only when the section is expanded: the collapsed heading
+  // shows the count, and a count that only appears after the operator opens the section is
+  // a count nobody sees. That is the failure mode this whole surface exists to end.
+  async function loadDeadLetters(): Promise<void> {
+    try {
+      const res = await api.rpc('GET', 'dead-letters') as { deadLetters: DeadLetter[] };
+      state.deadLetters = res.deadLetters ?? [];
+    } catch {
+      // A failure here must not blank the task list — this section is secondary.
+      state.deadLetters = [];
     }
   }
 
@@ -244,6 +264,27 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     }
   }
 
+  async function handleRequeue(taskId: string, summary: string): Promise<void> {
+    // Confirmed, because it puts work back in front of an agent. The caveat is in the
+    // prompt rather than only in the docs: requeueing does not fix why the task was
+    // dropped, and all seventeen of the records this shipped against would dead-letter
+    // again for the same reason (vikunja#63/#169).
+    if (!confirm(
+      `Requeue "${summary}"?\n\nIt returns to the queue at submitted with its retry count `
+      + 'reset. This does NOT fix why it was dropped — if the cause is still live it will '
+      + 'be dead-lettered again.',
+    )) return;
+    try {
+      await api.rpc('POST', `tasks/${taskId}/requeue`, { note: 'Requeued via CloudCLI' });
+      state.error = null;
+      showToast('Task requeued');
+      await loadTasks();
+    } catch (err) {
+      state.error = (err as Error).message;
+      render(api.context);
+    }
+  }
+
   async function handleSetStatus(taskId: string, status: string): Promise<void> {
     try {
       await api.rpc('POST', `tasks/${taskId}/status`, {
@@ -366,6 +407,17 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
           render(ctx);
         },
         onCopy: handleCopyCommand,
+      });
+
+      renderDeadLetters(root, {
+        deadLetters: state.deadLetters,
+        expanded: state.deadLettersExpanded,
+        colors: c,
+        onToggle: () => {
+          state.deadLettersExpanded = !state.deadLettersExpanded;
+          render(ctx);
+        },
+        onRequeue: handleRequeue,
       });
     }
   }

@@ -44,7 +44,39 @@ Live updates arrive over WebSocket: the backend watches the queue directory and 
   - **Park / Unpark** — pause a task without losing sight of it. A parked task stays in the list, renders muted with an `Unpark` button, is exempt from TTL expiry, and won't be picked up until you unpark it. Unparking returns it to the status it was parked from.
   - **Amend** — append a correction to a queued task. The original description is never rewritten; amendments render below it, highlighted, so a reader can't act on stale instructions by mistake.
   - **Status change** — advance a task an agent missed (audited operator override)
+  - **Requeue** — return a dead-lettered task to the queue at `submitted` (see below)
 - Live connection indicator and a manual refresh button
+
+## Dead letters
+
+A collapsed section below the task list, showing every record in
+`~/.claude/task-queue/dead-letters/` — tasks `task-dispatcher` gave up routing after
+exhausting its retries. Nothing picks one up and no agent can transition it.
+
+It exists because nothing could show them. `get_task` searched the queue root then
+`archive/` and answered `not found`; this plugin globbed the queue root only. Seventeen
+tasks accumulated in that directory between 2026-05-29 and 2026-07-25 — every one a
+security audit request, all seventeen carrying the identical `failed_reason` — and the
+only notice any of them ever got was a single Matrix message at the moment it was dropped.
+A known bug quietly ate seventeen security audits over three months (vikunja#557).
+
+Three decisions worth stating:
+
+- **Collapsed, and a section rather than a tab.** The healthy count here is zero, so a tab
+  would be permanently empty furniture. What it must never be is absent — the heading
+  renders whatever the count is, including `none`, and turns red the moment it is not.
+- **Grouped by failure reason.** Seventeen records with one identical reason are one bug
+  that fired seventeen times. Rendering them as seventeen sibling rows reproduces exactly
+  the reading that let them sit. Largest group first; newest failure first within a group.
+- **The count loads on every refresh, not on expand.** A count that only appears once the
+  operator opens the section is a count nobody sees.
+
+**Requeue** sends a record back to the queue at `submitted` with its `failed_reason`
+cleared and its retry count reset, via `POST /tasks/:id/requeue` on the control API — an
+operator-only route in `task-queue-mcp` v0.10.0+. It is confirmed before firing, and the
+confirmation says the thing that matters: requeueing does **not** fix why the task was
+dropped. All seventeen of the records this shipped against would dead-letter again for the
+same reason, which is vikunja#63/#169 and a separate piece of work.
 
 ## Headless runs
 
@@ -81,6 +113,9 @@ or env var — see [Backend API](#backend-api).
 
 - **Not a queue schema owner.** Statuses, transitions, and validation belong to `task-queue-mcp`. This plugin renders what that server permits and surfaces its rejections verbatim.
 - **Not an agent runner.** It can spawn a session for a task; it does not supervise, monitor, or manage agents after launch.
+- **Not a dead-letter fixer.** The Dead letters section shows what was dropped and offers
+  to put it back. It does not and cannot repair the reason it was dropped — that lives in
+  the dispatcher and in whatever wrote the task.
 - **Not a general task tracker.** It is scoped to one queue directory of agent-coordination tasks — not a replacement for an issue tracker.
 
 ## Installation
@@ -133,6 +168,8 @@ The backend exposes a small HTTP API consumed by the UI via `api.rpc()`.
 | `POST` | `/tasks/:id/park` | Park; body `{note?}` — proxied |
 | `POST` | `/tasks/:id/unpark` | Unpark; body `{note?, status?}` — proxied |
 | `POST` | `/tasks/:id/amend` | Append an amendment; body `{amendment, reason?}` — proxied |
+| `POST` | `/tasks/:id/requeue` | Requeue a dead-lettered task; body `{note?}` — proxied |
+| `GET` | `/dead-letters` | List dead-lettered tasks. Read-only |
 | `GET` | `/headless-runs` | List headless agent runs; query param `agent`. Read-only |
 | `GET` | `/headless-runs/:id` | One run's full log text plus scraped commands; `:id` is `<agent>-<task8>`. Read-only |
 

@@ -1,16 +1,22 @@
 // MCP control API proxy (mutations).
 //
 // The single validated, shared-secret-gated write path for queue mutations
-// (approve/cancel/status/park/unpark/amend). All of them proxy here so they
-// inherit the MCP core's transition validation + fcntl locking; the plugin
+// (approve/cancel/status/park/unpark/amend/requeue). All of them proxy here so
+// they inherit the MCP core's transition validation + fcntl locking; the plugin
 // never mutates task YAML directly. Reads stay direct (see server.ts).
+//
+// `requeue` is the operator's path out of the dead-letter queue. It is gated on the MCP
+// side by the same shared secret as every other route here, and its MCP *tool* twin
+// refuses any agent identity outright — a plugin acting as `operator` is exactly the
+// caller it is meant for.
 //
 // Extracted from server.ts so the auth/transport guards are unit-testable
 // without booting the plugin's HTTP server.
 
 const VALID_ID = /^[a-zA-Z0-9_-]+$/;
 
-export type ControlAction = 'approve' | 'cancel' | 'status' | 'park' | 'unpark' | 'amend';
+export type ControlAction =
+  'approve' | 'cancel' | 'status' | 'park' | 'unpark' | 'amend' | 'requeue';
 
 export interface ControlApiResult {
   status: number;

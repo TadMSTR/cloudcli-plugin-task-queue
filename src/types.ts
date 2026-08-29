@@ -83,6 +83,37 @@ export interface Task {
   history: TaskHistoryEntry[];
 }
 
+// ── Dead letters ───────────────────────────────────────────────────────
+
+/**
+ * One record from `~/.claude/task-queue/dead-letters/` — a task task-dispatcher gave up
+ * routing after exhausting its retries. It is not live work: nothing will pick it up, and
+ * it cannot be transitioned until an operator requeues it.
+ *
+ * Defined here rather than separately in server.ts and index.ts so the route's response
+ * shape has exactly one definition across the bundle boundary, same as HeadlessRun.
+ */
+export interface DeadLetter {
+  id: string;
+  created: string;
+  source_agent: string;
+  target_agent: string;
+  task_type: string;
+  summary: string;
+  /** `failed_reason.reason` — the thing to group on. */
+  reason: string;
+  /** `failed_reason.timestamp`; '' when the record carries none. */
+  failed_at: string;
+  retry_count: number;
+}
+
+/** Dead letters sharing one failure reason. N identical reasons are one problem. */
+export interface DeadLetterGroup {
+  reason: string;
+  count: number;
+  letters: DeadLetter[];
+}
+
 // ── Headless runs ──────────────────────────────────────────────────────
 
 /**
