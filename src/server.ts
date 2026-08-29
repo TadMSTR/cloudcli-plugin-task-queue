@@ -13,7 +13,7 @@ import type { DeadLetter, HeadlessRun, HeadlessRunDetail } from './types.ts';
 import { toDeadLetter } from './dead-letters.ts';
 import { isTerminal } from './vocabulary.ts';
 import {
-  parseRunRecord,
+  loadRunRecord,
   outcomeLabel,
   toHeadlessRunView,
   compareRuns,
@@ -35,6 +35,8 @@ import {
   buildLaunchArgv,
   launchLogName,
   runRecordFileName,
+  toStartMode,
+  START_MODES,
   lookupAgent,
   LaunchPolicyError,
   type LaunchPolicy,
@@ -278,18 +280,17 @@ function closeRunRecord(
   code: number | null,
   signal: NodeJS.Signals | null,
 ): void {
-  // Through the path guard, like every other read here. This one's content is not
-  // surfaced anywhere, which is exactly why it would be the copy that gets forgotten —
-  // and the list route's guard exists because a real ~/.secrets symlink was planted in
-  // this directory and read. One rule, every reader.
-  const target = resolveAllowedPath(
-    path.join(LAUNCH_LOG_DIR, runRecordFileName(agent, taskId)),
-    PREVIEW_ALLOWED_PREFIXES,
-  );
-  if (!target) return;
+  // Through loadRunRecord, like the list route — one guarded reader, and it is unit
+  // tested. This call site had its own inline read until the audit pointed out that a
+  // fix with no regression test is one refactor away from being undone, and that this
+  // reader is the one that gets forgotten precisely because its content is not surfaced.
+  const loaded = loadRunRecord(LAUNCH_LOG_DIR, agent, taskId, PREVIEW_ALLOWED_PREFIXES);
+  if (!loaded) return;
+  // The path the GUARD approved, not one re-derived here.
+  const target = loaded.path;
   try {
-    const existing = parseRunRecord(JSON.parse(fs.readFileSync(target, 'utf-8')));
-    if (!existing || existing.ended !== null) return;
+    const existing = loaded.record;
+    if (existing.ended !== null) return;
     existing.ended = new Date().toISOString();
     // A signalled child has no exit code — `code` is null and `signal` names it. Recorded
     // as the reason rather than coerced to a number, for the same reason the dispatcher
@@ -533,16 +534,7 @@ function readHead(filePath: string, bytes: number): string {
  * directory would otherwise put an arbitrary file's contents in front of the operator.
  */
 function readRunRecordFor(agent: string, taskId8: string): RunRecord | null {
-  const resolved = resolveAllowedPath(
-    path.join(LAUNCH_LOG_DIR, `${agent}-${taskId8}.json`),
-    PREVIEW_ALLOWED_PREFIXES,
-  );
-  if (!resolved) return null;
-  try {
-    return parseRunRecord(JSON.parse(fs.readFileSync(resolved, 'utf-8')));
-  } catch {
-    return null;   // absent or corrupt: fall back to the mtime derivation
-  }
+  return loadRunRecord(LAUNCH_LOG_DIR, agent, taskId8, PREVIEW_ALLOWED_PREFIXES)?.record ?? null;
 }
 
 /**
@@ -803,16 +795,34 @@ const server = http.createServer(async (req, res) => {
     const startMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)\/start$/);
     if (startMatch && req.method === 'POST') {
       const body = await readBody(req);
-      const { mode } = JSON.parse(body) as { mode: StartMode };
+      // Validated, not type-asserted. `as {mode: StartMode}` is a compile-time claim and
+      // no runtime check, and this value now reaches a task's persisted history note via
+      // recordStartInQueue. An unparseable body is refused here too rather than falling
+      // through to the `review` default — the mutation routes below already do this, and
+      // a Start is the one route where guessing has a visible consequence.
+      let mode: StartMode | null;
+      try {
+        mode = toStartMode((body ? JSON.parse(body) : {})?.mode);
+      } catch {
+        mode = null;
+      }
+      if (mode === null) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({
+          ok: false,
+          error: `invalid start mode — expected one of ${START_MODES.join(', ')}`,
+        }));
+        return;
+      }
       const taskData = getTask(startMatch[1]);
       if (!taskData) { res.statusCode = 404; res.end(JSON.stringify({ error: 'task not found' })); return; }
       const result = launchSession(
         startMatch[1],
         taskData.target_agent ?? '',
-        mode ?? 'review',
+        mode,
         taskData.workflow_mode,
       );
-      if (result.ok) await recordStartInQueue(startMatch[1], taskData, mode ?? 'review');
+      if (result.ok) await recordStartInQueue(startMatch[1], taskData, mode);
       res.statusCode = result.ok ? 200 : 400;
       res.end(JSON.stringify(result));
       return;

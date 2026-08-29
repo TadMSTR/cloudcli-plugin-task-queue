@@ -60,6 +60,35 @@ Tracker: vikunja#559. Build plan: agent-workflow-interop-2026-08, Phase 3.
 - `runRecordFileName` sits beside `launchLogName` in `launch-policy.ts`, pinned to it by a
   round-trip test. If the two stems disagree, one run renders as two rows.
 
+### Security
+
+Both from the audit (`agent-workflow-interop-2026-08-phase34`, 0 Critical/High/Medium,
+2 Info). Both fixed rather than accepted.
+
+- **`mode` on `POST /tasks/:id/start` is validated, not type-asserted.** `JSON.parse(body)
+  as {mode: StartMode}` is a compile-time claim and no runtime check. Harmless while the
+  value only reached `=== 'review'` comparisons that fell through safely — but this
+  release gave it a second consumer that writes it into a task's **persisted history
+  note**, and a value that lands in a durable record deserves a validator. `toStartMode()`
+  now sits beside the type in `launch-policy.ts`, with the closed set exported so the two
+  cannot drift.
+
+  An absent mode still defaults to `review`; a present but unrecognised one is a 400.
+  Defaulting there would silently downgrade an operator who asked for `auto`, turning a
+  typo into a session that quietly does nothing. An unparseable body is refused for the
+  same reason.
+
+- **`loadRunRecord()` is now the only way this plugin reads a run record**, extracted into
+  `run-record.ts` so the path guard has tests. `closeRunRecord`'s guard was added during
+  the pre-audit and had no regression test of its own — `server.ts` calls `listen()` at
+  import time, so nothing in it can be unit-tested, which is the same property that let
+  the guard be omitted to begin with. The audit's point was that a fix with no test is one
+  refactor from being undone.
+
+  It returns the **guard-approved** path alongside the record, so a caller writing the
+  record back uses the path realpath approved rather than re-deriving one that was never
+  checked. Seven tests, including a real escaping symlink and a non-escaping one.
+
 ### Unchanged, deliberately
 
 - **Status still comes from the queue and only from the queue.** A record saying a run

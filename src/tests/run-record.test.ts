@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { launchLogName, runRecordFileName } from '../launch-policy.ts';
 import { parseLaunchLogName, parseRunRecordName } from '../launch-log.ts';
 import { parseRunRecord, recordSpan, outcomeLabel, type RunRecord } from '../run-record.ts';
@@ -262,4 +264,125 @@ test('two open runs sort most-recently-started first', () => {
   const older = toHeadlessRunView(sources({ record: record({ started: '2026-08-01T00:00:00.000Z' }), fileTimes: null }));
   const newer = toHeadlessRunView(sources({ record: record({ started: '2026-08-29T00:00:00.000Z' }), fileTimes: null }));
   assert.deepEqual([older, newer].sort(compareRuns).map(r => r.started), [newer.started, older.started]);
+});
+
+// ── The guarded reader ────────────────────────────────────────────────
+//
+// Added at the audit's request (agent-workflow-interop-2026-08-phase34, INFO 2). The
+// path guard on closeRunRecord() was fixed during the pre-audit and had no regression
+// test of its own — server.ts calls listen() at import time, so nothing in it can be
+// unit-tested. That is the same property that let the guard be omitted in the first
+// place, so the read was extracted here rather than the gap being accepted.
+
+import os from 'node:os';
+import { loadRunRecord } from '../run-record.ts';
+
+function tmpdir(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'run-record-test-'));
+}
+
+function writeRecord(dir: string, agent: string, taskId: string, over: Partial<RunRecord> = {}): string {
+  const file = path.join(dir, runRecordFileName(agent, taskId));
+  fs.writeFileSync(file, JSON.stringify(record({ agent, task_id: taskId, ...over })));
+  return file;
+}
+
+test('loadRunRecord reads a record inside an allowed prefix', () => {
+  const dir = fs.realpathSync(tmpdir());
+  writeRecord(dir, 'developer', TASK);
+  const loaded = loadRunRecord(dir, 'developer', TASK, [dir]);
+  assert.equal(loaded?.record.agent, 'developer');
+  assert.equal(loaded?.record.task_id, TASK);
+  assert.equal(loaded?.path, path.join(dir, 'developer-f42d3aeb.json'));
+});
+
+test('loadRunRecord refuses a record outside every allowed prefix', () => {
+  const dir = fs.realpathSync(tmpdir());
+  writeRecord(dir, 'developer', TASK);
+  assert.equal(loadRunRecord(dir, 'developer', TASK, [fs.realpathSync(tmpdir())]), null);
+});
+
+test('loadRunRecord refuses a SYMLINK that escapes the allowed prefix', () => {
+  // THE regression test the audit asked for. A symlink sitting inside an allowed
+  // directory and pointing outside it passes a path.resolve-only check; only realpath
+  // catches it. The list route's guard exists because a real ~/.secrets/forge.env
+  // symlink was planted in the live launch directory and read.
+  const dir = fs.realpathSync(tmpdir());
+  const outside = fs.realpathSync(tmpdir());
+  const secret = path.join(outside, 'secret.json');
+  fs.writeFileSync(secret, JSON.stringify({ task_id: TASK, agent: 'not-yours' }));
+  fs.symlinkSync(secret, path.join(dir, runRecordFileName('developer', TASK)));
+
+  // Readable as a plain file — so this is not passing for want of a target.
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'developer-f42d3aeb.json'), 'utf-8')).agent, 'not-yours');
+  assert.equal(loadRunRecord(dir, 'developer', TASK, [dir]), null);
+});
+
+test('loadRunRecord accepts a symlink that stays inside the allowed prefix', () => {
+  // The guard is about the RESOLVED location, not about symlinks being forbidden.
+  const dir = fs.realpathSync(tmpdir());
+  const real = path.join(dir, 'real.json');
+  fs.writeFileSync(real, JSON.stringify(record()));
+  fs.symlinkSync(real, path.join(dir, runRecordFileName('developer', TASK)));
+  assert.equal(loadRunRecord(dir, 'developer', TASK, [dir])?.path, real);
+});
+
+test('loadRunRecord returns null for an absent record', () => {
+  const dir = fs.realpathSync(tmpdir());
+  assert.equal(loadRunRecord(dir, 'developer', TASK, [dir]), null);
+});
+
+test('loadRunRecord returns null for a corrupt record rather than throwing', () => {
+  const dir = fs.realpathSync(tmpdir());
+  fs.writeFileSync(path.join(dir, runRecordFileName('developer', TASK)), '{not json');
+  assert.equal(loadRunRecord(dir, 'developer', TASK, [dir]), null);
+});
+
+test('loadRunRecord returns the guard-approved path, for callers that write back', () => {
+  // closeRunRecord() stamps the exit code onto this path. Re-deriving one would write to
+  // a location the guard never approved — through the symlink, in the escaping case.
+  const dir = fs.realpathSync(tmpdir());
+  const real = path.join(dir, 'real.json');
+  fs.writeFileSync(real, JSON.stringify(record()));
+  fs.symlinkSync(real, path.join(dir, runRecordFileName('developer', TASK)));
+  const loaded = loadRunRecord(dir, 'developer', TASK, [dir]);
+  assert.equal(loaded?.path, real, 'must be the resolved target, not the link name');
+});
+
+test('loadRunRecord takes a full task id or an 8-char prefix', () => {
+  // The list route holds only the prefix parsed from a filename; closeRunRecord holds
+  // the whole id. Both must land on the same file.
+  const dir = fs.realpathSync(tmpdir());
+  writeRecord(dir, 'developer', TASK);
+  assert.equal(loadRunRecord(dir, 'developer', TASK, [dir])?.record.task_id, TASK);
+  assert.equal(loadRunRecord(dir, 'developer', 'f42d3aeb', [dir])?.record.task_id, TASK);
+});
+
+// ── Start mode validation ─────────────────────────────────────────────
+
+import { toStartMode, START_MODES } from '../launch-policy.ts';
+
+test('an absent mode keeps the review default', () => {
+  // The safe leg: read the task and wait. Long-standing behaviour, not a new guess.
+  assert.equal(toStartMode(undefined), 'review');
+  assert.equal(toStartMode(null), 'review');
+});
+
+test('both real modes survive', () => {
+  for (const m of START_MODES) assert.equal(toStartMode(m), m);
+});
+
+test('a present but unrecognised mode is null, NOT the default', () => {
+  // Defaulting here would silently downgrade an operator who asked for `auto`, turning a
+  // typo into a session that quietly does nothing. The route refuses instead.
+  for (const raw of ['auto ', 'AUTO', 'plan', '', 'semi-auto', 42, true, {}, ['auto']]) {
+    assert.equal(toStartMode(raw), null, `accepted ${JSON.stringify(raw)}`);
+  }
+});
+
+test('an arbitrary string cannot ride into a persisted history note', () => {
+  // The reason this validator exists: `mode` reaches recordStartInQueue's note, which
+  // the control API persists into the task's history.
+  assert.equal(toStartMode('review"; DROP'), null);
+  assert.equal(toStartMode('<img src=x onerror=1>'), null);
 });

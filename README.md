@@ -227,6 +227,11 @@ The upgrade handler gates on the **peer address** first: the server binds `127.0
 | `review` | `plan` | Read the task, present a summary, wait for approval |
 | `auto` | `default` | Read the task, claim it (`in-progress`), execute |
 
+`mode` is validated against that set at the parse site. An **omitted** mode defaults to
+`review` — the safe leg. A **present but unrecognised** mode is a 400, not a silent
+default: defaulting would downgrade an operator who asked for `auto`, turning a typo into
+a session that quietly does nothing.
+
 ### The launch policy file
 
 A task's `target_agent` is resolved through a **data file**, not a map in the source:

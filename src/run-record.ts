@@ -18,6 +18,11 @@
  * the record outright.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { resolveAllowedPath } from './path-guard.ts';
+import { runRecordFileName } from './launch-policy.ts';
+
 /** What a launcher writes. Nulls are meaningful: see `exit_code`. */
 export interface RunRecord {
   run_id: string;
@@ -91,6 +96,45 @@ export function parseRunRecord(raw: unknown): RunRecord | null {
     reaped: strOrNull(r.reaped),
     log_path: str(r.log_path),
   };
+}
+
+/** A record and the realpath-resolved path it was read from. */
+export interface LoadedRunRecord {
+  path: string;
+  record: RunRecord;
+}
+
+/**
+ * Read a run record through the path guard. THE only way this plugin reads one.
+ *
+ * Extracted here rather than left in server.ts because server.ts calls `listen()` at
+ * import time and cannot be unit-tested — which is exactly how one of its two readers
+ * came to be missing this guard in the first place. That reader's content is not
+ * surfaced anywhere, so nothing failed and nothing was red; it was found by a pre-audit
+ * sweep and its fix then had no regression test of its own. Both readers now call this,
+ * and this has tests.
+ *
+ * Returns the resolved path alongside the record so a caller that writes the record back
+ * uses the path the guard approved, rather than re-deriving one that was never checked.
+ */
+export function loadRunRecord(
+  dir: string,
+  agent: string,
+  taskId: string,
+  allowedPrefixes: string[],
+): LoadedRunRecord | null {
+  const resolved = resolveAllowedPath(
+    path.join(dir, runRecordFileName(agent, taskId)),
+    allowedPrefixes,
+  );
+  if (!resolved) return null;
+  let record: RunRecord | null;
+  try {
+    record = parseRunRecord(JSON.parse(fs.readFileSync(resolved, 'utf-8')));
+  } catch {
+    return null;   // absent or corrupt: the caller falls back to the mtime derivation
+  }
+  return record ? { path: resolved, record } : null;
 }
 
 export interface RunSpan {
