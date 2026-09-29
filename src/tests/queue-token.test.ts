@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -66,6 +67,25 @@ test('a directory at the path fails closed', () => {
   const d = tmp();
   const f = path.join(d, 'token');
   fs.mkdirSync(f, { mode: 0o700 });
+  const r = loadToken(f);
+  assert.equal(r.ok, false);
+  assert.match(r.ok ? '' : r.error, /not a regular file/);
+});
+
+test('a symlink at the token path fails closed, even to a 0600 file', () => {
+  const d = tmp();
+  const real = write(d, SECRET_SHAPED); // 0600, would pass every other check
+  const link = path.join(d, 'link');
+  fs.symlinkSync(real, link);
+  const r = loadToken(link);
+  assert.equal(r.ok, false);
+  assert.match(r.ok ? '' : r.error, /symlink/);
+});
+
+test('a FIFO at the token path fails closed without hanging', () => {
+  const d = tmp();
+  const f = path.join(d, 'token');
+  execFileSync('mkfifo', ['-m', '600', f]);
   const r = loadToken(f);
   assert.equal(r.ok, false);
   assert.match(r.ok ? '' : r.error, /not a regular file/);

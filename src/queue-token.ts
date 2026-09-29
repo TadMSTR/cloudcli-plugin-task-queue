@@ -28,8 +28,11 @@ export type TokenResult =
   | { ok: false; error: string };
 
 interface TokenFs {
-  statSync(p: string): { isFile(): boolean; mode: number };
-  readFileSync(p: string, enc: 'utf-8'): string;
+  openSync(p: string, flags: number): number;
+  fstatSync(fd: number): { isFile(): boolean; mode: number };
+  readFileSync(fd: number, enc: 'utf-8'): string;
+  closeSync(fd: number): void;
+  constants: { O_RDONLY: number; O_NOFOLLOW: number; O_NONBLOCK: number };
 }
 
 /**
@@ -39,39 +42,51 @@ interface TokenFs {
  * Fails closed when the file is missing, is not a regular file, is empty, or carries ANY
  * group or other permission bit. A token file others can read is not one this plugin
  * should be quietly using; the fix is `chmod 600`, and the error says so.
+ *
+ * The checks and the read go through ONE file descriptor. Checking the path with stat()
+ * and then reading the path again would let the file be swapped between the two, so the
+ * bytes read would come from a file whose mode was never checked. O_NOFOLLOW refuses a
+ * symlink at the final component, and O_NONBLOCK keeps a FIFO planted at the path from
+ * hanging the open; fstat then rejects it as not a regular file.
  */
 export function loadToken(file: string, fsImpl: TokenFs = fs): TokenResult {
-  let st: { isFile(): boolean; mode: number };
+  const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fsImpl.constants;
+  let fd: number;
   try {
-    st = fsImpl.statSync(file);
+    fd = fsImpl.openSync(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    return code === 'ENOENT'
-      ? { ok: false, error: `task-queue token file ${file} is missing` }
-      : { ok: false, error: `task-queue token file ${file} is unreadable (${code ?? 'error'})` };
-  }
-  if (!st.isFile()) {
-    return { ok: false, error: `task-queue token file ${file} is not a regular file` };
-  }
-  if ((st.mode & 0o077) !== 0) {
-    const mode = (st.mode & 0o777).toString(8).padStart(3, '0');
-    return {
-      ok: false,
-      error: `task-queue token file ${file} is accessible to group or others (mode ${mode}); chmod 600 it`,
-    };
-  }
-  let text: string;
-  try {
-    text = fsImpl.readFileSync(file, 'utf-8');
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return { ok: false, error: `task-queue token file ${file} is missing` };
+    if (code === 'ELOOP') return { ok: false, error: `task-queue token file ${file} is a symlink` };
     return { ok: false, error: `task-queue token file ${file} is unreadable (${code ?? 'error'})` };
   }
-  // Whitespace is trimmed so a trailing newline from `echo` or an editor does not become
-  // part of the token. A token is URL-safe base64 and never contains whitespace.
-  const token = text.trim();
-  if (!token) {
-    return { ok: false, error: `task-queue token file ${file} is empty` };
+  try {
+    const st = fsImpl.fstatSync(fd);
+    if (!st.isFile()) {
+      return { ok: false, error: `task-queue token file ${file} is not a regular file` };
+    }
+    if ((st.mode & 0o077) !== 0) {
+      const mode = (st.mode & 0o777).toString(8).padStart(3, '0');
+      return {
+        ok: false,
+        error: `task-queue token file ${file} is accessible to group or others (mode ${mode}); chmod 600 it`,
+      };
+    }
+    let text: string;
+    try {
+      text = fsImpl.readFileSync(fd, 'utf-8');
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      return { ok: false, error: `task-queue token file ${file} is unreadable (${code ?? 'error'})` };
+    }
+    // Whitespace is trimmed so a trailing newline from `echo` or an editor does not become
+    // part of the token. A token is URL-safe base64 and never contains whitespace.
+    const token = text.trim();
+    if (!token) {
+      return { ok: false, error: `task-queue token file ${file} is empty` };
+    }
+    return { ok: true, token };
+  } finally {
+    try { fsImpl.closeSync(fd); } catch { /* already closed */ }
   }
-  return { ok: true, token };
 }

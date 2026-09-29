@@ -13,12 +13,16 @@ src/
   index.ts              UI entry — mount/unmount, app state, action handlers.
                         Talks to the backend only via api.rpc(). No fs, no fetch.
   server.ts             Backend — HTTP + WebSocket, launched by CloudCLI as a
-                        subprocess. Reads queue YAML directly; proxies every
-                        mutation to control-api.ts. Owns the file watcher and
-                        the session launcher.
-  control-api.ts        The single outbound mutation path to task-queue-mcp.
-                        Extracted from server.ts so the auth and transport
-                        guards are unit-testable without booting the server.
+                        subprocess. Reads and writes the queue only through
+                        control-api.ts (task-queue-mcp's HTTP API); parses no
+                        queue YAML. Owns the file watcher (a change trigger)
+                        and the session launcher.
+  control-api.ts        The single outbound path to task-queue-mcp: queue reads
+                        (queueGet) and mutations (callControlApi). Extracted from
+                        server.ts so the auth and transport guards are
+                        unit-testable without booting the server.
+  queue-token.ts        Loads the plugin's client token from the fixed file
+                        under $HOME, failing closed on mode or content.
   ws-guard.ts           The WebSocket upgrade decision, as a pure function of
                         (peer address, Origin, allowlist). Extracted for the
                         same reason: server.ts listens at import time.
