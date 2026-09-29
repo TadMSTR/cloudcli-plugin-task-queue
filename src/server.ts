@@ -194,7 +194,10 @@ async function listTasks(
 async function getTask(taskId: string): Promise<Task | null> {
   if (!VALID_ID.test(taskId)) return null;
   const result = await queueGet(`/tasks/${encodeURIComponent(taskId)}`, apiOpts());
-  if (result.status === 404 || result.status === 400) return null;
+  // Only a 404 means "no such task". The id was validated above, so a 400 from the API is
+  // a disagreement worth seeing, and is surfaced like any other API failure rather than
+  // rendered as "task not found".
+  if (result.status === 404) return null;
   if (result.status !== 200) throw new QueueReadError(502, apiErrorMessage(result));
   return ((result.data as { task?: Task }).task) ?? null;
 }
