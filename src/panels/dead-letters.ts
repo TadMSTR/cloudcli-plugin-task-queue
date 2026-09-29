@@ -18,6 +18,8 @@ import { groupByReason } from '../dead-letters.ts';
  */
 interface DeadLettersOptions {
   deadLetters: DeadLetter[];
+  /** The API's page limit cut the read, so the count below is a floor. */
+  truncated: boolean;
   expanded: boolean;
   colors: ThemeColors;
   onToggle: () => void;
@@ -53,6 +55,7 @@ export function renderDeadLetters(parent: HTMLElement, opts: DeadLettersOptions)
     : `${count} dropped · ${groupByReason(deadLetters).length} distinct reason${
         groupByReason(deadLetters).length === 1 ? '' : 's'
       }`;
+  if (opts.truncated) badge.textContent += ' · truncated, there may be more';
   head.appendChild(badge);
 
   section.appendChild(head);

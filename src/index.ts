@@ -10,6 +10,10 @@ import { createWsClient, WsClient } from './panels/ws-client.ts';
 
 interface AppState {
   tasks: Task[];
+  /** Records the API matched, which exceeds tasks.length when it truncated. */
+  taskCount: number;
+  /** The API's page limit cut the list. Rendered in the header, never hidden. */
+  tasksTruncated: boolean;
   selectedTaskId: string | null;
   selectedTask: Task | null;
   contextPreviews: Map<string, string>;
@@ -22,6 +26,7 @@ interface AppState {
   selectedRun: HeadlessRunDetail | null;
   runAgentFilter: string;
   deadLetters: DeadLetter[];
+  deadLettersTruncated: boolean;
   /** Collapsed by default — the healthy count is zero. */
   deadLettersExpanded: boolean;
 }
@@ -33,6 +38,8 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
 
   const state: AppState = {
     tasks: [],
+    taskCount: 0,
+    tasksTruncated: false,
     selectedTaskId: null,
     selectedTask: null,
     contextPreviews: new Map(),
@@ -45,6 +52,7 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     selectedRun: null,
     runAgentFilter: '',
     deadLetters: [],
+    deadLettersTruncated: false,
     deadLettersExpanded: false,
   };
 
@@ -88,8 +96,10 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
 
   async function loadTasks(): Promise<void> {
     try {
-      const res = await api.rpc('GET', 'tasks') as { tasks: Task[] };
+      const res = await api.rpc('GET', 'tasks') as { tasks: Task[]; count?: number; truncated?: boolean };
       state.tasks = res.tasks ?? [];
+      state.taskCount = res.count ?? state.tasks.length;
+      state.tasksTruncated = res.truncated === true;
       state.error = null;
     } catch (err) {
       state.error = (err as Error).message;
@@ -122,11 +132,13 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   // a count nobody sees. That is the failure mode this whole surface exists to end.
   async function loadDeadLetters(): Promise<void> {
     try {
-      const res = await api.rpc('GET', 'dead-letters') as { deadLetters: DeadLetter[] };
+      const res = await api.rpc('GET', 'dead-letters') as { deadLetters: DeadLetter[]; truncated?: boolean };
       state.deadLetters = res.deadLetters ?? [];
+      state.deadLettersTruncated = res.truncated === true;
     } catch {
       // A failure here must not blank the task list — this section is secondary.
       state.deadLetters = [];
+      state.deadLettersTruncated = false;
     }
   }
 
@@ -411,6 +423,7 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
 
       renderDeadLetters(root, {
         deadLetters: state.deadLetters,
+        truncated: state.deadLettersTruncated,
         expanded: state.deadLettersExpanded,
         colors: c,
         onToggle: () => {
@@ -438,6 +451,9 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     header.innerHTML = `
       <span style="font-size:14px;font-weight:600;color:${c.accent}">Task Queue</span>
       <span style="color:${c.muted};font-size:11px">${state.tasks.length} tasks</span>
+      ${state.tasksTruncated
+        ? `<span style="color:${c.error};font-size:11px" title="The task-queue API returns at most one page. Records past it are not shown.">truncated: showing ${state.tasks.length} of ${state.taskCount}</span>`
+        : ''}
       <span style="margin-left:auto;display:flex;align-items:center;gap:6px">
         <span id="tq-ws-dot" style="display:inline-block;width:6px;height:6px;border-radius:50%"></span>
         <span id="tq-ws-label" style="color:${c.muted};font-size:11px"></span>
