@@ -36,6 +36,13 @@ v0.11.0 or later** and a token file (below).
 
 - `TASK_QUEUE_API_SECRET` and the `X-Task-Queue-Secret` header.
 
+### Security
+
+- **js-yaml 4.3.1 → 4.3.2** (GHSA-2883-xcg3-v3hh, high: merge keys with empty sources
+  are not bounded by `maxTotalMergeKeys`). The plugin parses one YAML file, the
+  operator-owned launch policy, so exposure was low; the production-dependency audit gate
+  failed on it.
+
 ## [0.10.0] - 2026-08-29
 
 Tracker: vikunja#560. Build plan: agent-workflow-interop-2026-08, Phase 5.5 and 5.6.
