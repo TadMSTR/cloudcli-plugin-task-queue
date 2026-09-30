@@ -29,6 +29,10 @@ v0.11.0 or later** and a token file (below).
 - **Truncation is shown.** The API returns at most 1000 records per read. When it cuts
   records off, the header reads `truncated: showing N of M`, and the dead-letters badge
   says the count may be low.
+- **Start launches only live, unfinished work.** Task lookup now also resolves archived and
+  dead-lettered records, which the old directory scan never saw. `POST /tasks/:id/start`
+  refuses any task outside the live queue or in a terminal status with a 409 and the reason
+  (`launchRefusal` in `launch-guards.ts`), so the launch surface is no wider than before.
 - **`TASK_QUEUE_API` must be `https://`, or `http://` to a loopback host.** The token goes
   on every read and write, so the plugin refuses to send it in cleartext to another host
   (each request fails with an error naming the variable). The default passes.

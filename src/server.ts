@@ -21,7 +21,7 @@ import { resolveAllowedPath } from './path-guard.ts';
 import type { DeadLetter, HeadlessRun, HeadlessRunDetail } from './types.ts';
 import { toDeadLetter } from './dead-letters.ts';
 import { isTerminal } from './vocabulary.ts';
-import { preLaunchEnv } from './launch-guards.ts';
+import { preLaunchEnv, launchRefusal } from './launch-guards.ts';
 import {
   loadRunRecord,
   outcomeLabel,
@@ -868,6 +868,12 @@ const server = http.createServer(async (req, res) => {
       }
       const taskData = await getTask(startMatch[1]);
       if (!taskData) { res.statusCode = 404; res.end(JSON.stringify({ error: 'task not found' })); return; }
+      const refusal = launchRefusal(taskData);
+      if (refusal) {
+        res.statusCode = 409;
+        res.end(JSON.stringify({ ok: false, error: `not launching: ${refusal}` }));
+        return;
+      }
       const result = launchSession(
         startMatch[1],
         taskData.target_agent ?? '',
