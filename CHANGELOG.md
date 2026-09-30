@@ -29,6 +29,9 @@ v0.11.0 or later** and a token file (below).
 - **Truncation is shown.** The API returns at most 1000 records per read. When it cuts
   records off, the header reads `truncated: showing N of M`, and the dead-letters badge
   says the count may be low.
+- **`TASK_QUEUE_API` must be `https://`, or `http://` to a loopback host.** The token goes
+  on every read and write, so the plugin refuses to send it in cleartext to another host
+  (each request fails with an error naming the variable). The default passes.
 - The `tasks` WebSocket event no longer carries a file `count`, which the UI never read.
   The queue watcher is now a change trigger only.
 

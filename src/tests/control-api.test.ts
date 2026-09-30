@@ -285,3 +285,35 @@ test('the manifest requests no task-queue credential from the host env', async (
   const env = (manifest.permissions ?? []).filter(p => p.startsWith('env:'));
   assert.deepEqual(env.sort(), ['env:CLOUDCLI_ORIGIN', 'env:TASK_QUEUE_API']);
 });
+
+// ── transport guard (CodeRabbit on the bot's twin PR) ─────────────────
+
+import { insecureApiBase } from '../control-api.ts';
+
+test('loopback http and any https are accepted', () => {
+  for (const base of [
+    'http://127.0.0.1:8485', 'http://127.0.0.2:8485', 'http://localhost:8485',
+    'http://[::1]:8485', 'https://tasks.example.com', 'https://10.0.0.5:8485',
+  ]) {
+    assert.equal(insecureApiBase(base), null, base);
+  }
+});
+
+test('cleartext to another host, and non-URLs, are refused', () => {
+  for (const base of [
+    'http://10.0.0.5:8485', 'http://tasks.example.com', 'http://127.0.0.1.evil.example',
+    'ftp://127.0.0.1', '127.0.0.1:8485', '',
+  ]) {
+    assert.notEqual(insecureApiBase(base), null, base);
+  }
+});
+
+test('an insecure base never sends the token, on reads or writes', async () => {
+  const fetchSpy = spyFetch();
+  const opts = { apiBase: 'http://10.0.0.5:8485', token: GOOD, fetchImpl: fetchSpy.impl };
+  const read = await queueGet('/tasks', opts);
+  const write = await callControlApi('task-abc', 'approve', {}, opts);
+  assert.equal(read.status, 500);
+  assert.equal(write.status, 500);
+  assert.equal(fetchSpy.calls.length, 0);
+});

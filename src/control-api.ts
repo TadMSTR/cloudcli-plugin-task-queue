@@ -45,6 +45,30 @@ export interface ControlApiOptions {
 }
 
 /**
+ * Why `apiBase` must not carry the token, or null if it may.
+ *
+ * The token (read + operator-write) goes on every request, reads included. Over plain
+ * HTTP to another host, anything on the path could take it and act as the operator. So
+ * `http://` is accepted only for a loopback host — the default, `http://127.0.0.1:8485` —
+ * and anything else must be `https://`.
+ */
+export function insecureApiBase(apiBase: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(apiBase);
+  } catch {
+    return `TASK_QUEUE_API ${JSON.stringify(apiBase)} is not a URL`;
+  }
+  if (url.protocol === 'https:' && url.hostname) return null;
+  if (url.protocol === 'http:') {
+    // URL keeps the brackets on an IPv6 literal.
+    const host = url.hostname.toLowerCase();
+    if (host === 'localhost' || host === '[::1]' || /^127(\.\d{1,3}){3}$/.test(host)) return null;
+  }
+  return `TASK_QUEUE_API ${JSON.stringify(apiBase)} refused: the client token is only sent over https://, or over http:// to a loopback host`;
+}
+
+/**
  * A request that never left the plugin because it has no usable token. Logged to stderr
  * (captured into the CloudCLI process's PM2 error log) and returned as a 500 whose error
  * names the file, so the UI says exactly what to fix.
@@ -95,6 +119,8 @@ export async function callControlApi(
     return { status: 400, data: { ok: false, error: 'invalid task id' } };
   }
   const what = `control API ${action} on task ${taskId}`;
+  const insecure = insecureApiBase(opts.apiBase);
+  if (insecure) return noToken(what, insecure);
   if (!opts.token.ok) return noToken(what, opts.token.error);
 
   return send(
@@ -117,6 +143,8 @@ export async function callControlApi(
  */
 export async function queueGet(route: string, opts: ControlApiOptions): Promise<ControlApiResult> {
   const what = `read ${route.split('?')[0]}`;
+  const insecure = insecureApiBase(opts.apiBase);
+  if (insecure) return noToken(what, insecure);
   if (!opts.token.ok) return noToken(what, opts.token.error);
   return send(
     `${opts.apiBase}${route}`,

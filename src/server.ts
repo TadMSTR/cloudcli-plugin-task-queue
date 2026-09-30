@@ -10,6 +10,7 @@ import {
   queueGet,
   tasksQuery,
   apiErrorMessage,
+  insecureApiBase,
   LIST_PAGE_MAX,
   type ControlAction,
   type ControlApiOptions,
@@ -980,6 +981,9 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(0, '127.0.0.1', () => {
   const addr = server.address() as { port: number };
   console.log(JSON.stringify({ ready: true, port: addr.port }));
+  // Report a refused TASK_QUEUE_API at boot too; every request would fail on it anyway.
+  const insecure = insecureApiBase(TASK_QUEUE_API);
+  if (insecure) process.stderr.write(`[task-queue] ${insecure} — every queue read and write will fail\n`);
   // Load (and, if broken, report) the token at boot rather than on the first click.
   if (queueToken().ok) process.stderr.write(`[task-queue] client token loaded from ${TOKEN_FILE}\n`);
   startWatcher(broadcast);

@@ -178,7 +178,7 @@ pm2 restart cloudcli
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `TASK_QUEUE_API` | `http://127.0.0.1:8485` | Base URL of the task-queue-mcp HTTP API. Configurable — the default assumes the MCP server runs loopback-local to CloudCLI. |
+| `TASK_QUEUE_API` | `http://127.0.0.1:8485` | Base URL of the task-queue-mcp HTTP API. Configurable — the default assumes the MCP server runs loopback-local to CloudCLI. Must be `https://`, or `http://` to a loopback host: the client token goes on every request, so anything else is refused. |
 | `CLOUDCLI_ORIGIN` | — | Additional allowed WebSocket origin, and the origin the CloudCLI host's plugin proxy sends on its upstream leg. Both sides read the same variable so they cannot disagree. `http://localhost:3001` and `http://127.0.0.1:3001` are always allowed. |
 | `AGENT_LAUNCH_POLICY` | `~/scripts/agent-launch.yml` | Path to the launch policy file (see [Session launch behaviour](#session-launch-behaviour)). |
 
