@@ -32,7 +32,7 @@ Routing writes through `task-queue-mcp` means mutations inherit its transition v
 - **UI** (`dist/index.js`) — renders the tab panel: a filterable task list and a detail view with history timeline, amendments, and context-ref previews.
 - **Backend** (`dist/server.js`) — HTTP + WebSocket server launched by CloudCLI. Picks a free ephemeral port at startup and reports it to CloudCLI as JSON on stdout. The UI reaches it through CloudCLI's plugin RPC API (`api.rpc()`).
 
-Live updates arrive over WebSocket: the backend watches the queue directory and pushes a `tasks` event when files change; the UI debounces, then re-reads through the API.
+Live updates arrive over WebSocket: the backend watches the queue directory and pushes a `tasks` event when files change; the UI debounces, then re-reads through the API. A refresh makes its three reads (tasks, headless runs, dead letters) in parallel, and the backend answers the first two from one upstream `GET /tasks`. After a button press the UI refreshes once, and skips the watcher's event for the same write (since v0.12.0).
 
 If the API truncated a read (it returns at most 1000 records per call), the header says **truncated: showing N of M** and the dead-letters badge says the count may be low. It is never hidden.
 

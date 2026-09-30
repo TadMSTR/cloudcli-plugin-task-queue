@@ -5,6 +5,7 @@ import { renderTaskDetail } from './panels/task-detail.ts';
 import { renderHeadlessRuns } from './panels/headless-runs.ts';
 import { renderDeadLetters } from './panels/dead-letters.ts';
 import { createWsClient, WsClient } from './panels/ws-client.ts';
+import { Latest, coveredByRefresh } from './refresh-rules.ts';
 
 // ── State ──────────────────────────────────────────────────────────────
 
@@ -82,64 +83,74 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   });
   container.appendChild(root);
 
-  // Debounce WS-triggered refreshes
+  // Debounce WS-triggered refreshes. `eventAt` is when the latest watcher event arrived.
+  // The coverage check runs when the timer fires rather than on arrival, so a refresh
+  // still in flight when the event came in has had time to succeed or fail.
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
-  function debouncedRefresh(delayMs = 2000): void {
+  function debouncedRefresh(eventAt: number, delayMs = 2000): void {
     if (refreshTimer) clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => {
       refreshTimer = null;
+      // Skipped when a refresh already read the list after the change this event reports,
+      // usually this tab's own button a second earlier. See coveredByRefresh.
+      if (coveredByRefresh(lastGoodLoadStartedAt, eventAt)) return;
       loadTasks();
     }, delayMs);
   }
 
   // ── Data loading ──────────────────────────────────────────────────
 
+  // A refresh applies its results only if no newer one has started since: with the three
+  // reads in parallel, an older refresh can resolve after a newer one, and must not put the
+  // older list back on screen.
+  const listLoads = new Latest();
+  // When the latest loadTasks() whose list read SUCCEEDED started, on the monotonic clock.
+  // A failed refresh covers nothing: its error stays on screen until something re-reads.
+  let lastGoodLoadStartedAt = -Infinity;
+
   async function loadTasks(): Promise<void> {
-    try {
-      const res = await api.rpc('GET', 'tasks') as { tasks: Task[]; count?: number; truncated?: boolean };
-      state.tasks = res.tasks ?? [];
-      state.taskCount = res.count ?? state.tasks.length;
-      state.tasksTruncated = res.truncated === true;
+    const isLatest = listLoads.begin();
+    const startedAt = performance.now();
+    // Reads only, in parallel. The backend answers /tasks and /headless-runs from ONE
+    // upstream GET /tasks when they arrive together (see shared-read.ts).
+    const [tasks, runs, dead] = await Promise.allSettled([
+      api.rpc('GET', 'tasks') as Promise<{ tasks: Task[]; count?: number; truncated?: boolean }>,
+      // Loaded UNFILTERED. The agent filter is applied for display in the panel, so it
+      // costs no round trip and — more importantly — runForTask() can still find a task's
+      // run while the section is filtered to a different agent. The route's ?agent=
+      // parameter still exists for direct API use.
+      api.rpc('GET', 'headless-runs') as Promise<{ runs: HeadlessRun[] }>,
+      // Loaded on every refresh, not only when the section is expanded: the collapsed
+      // heading shows the count, and a count that only appears after the operator opens
+      // the section is a count nobody sees. That is the failure mode this whole surface
+      // exists to end.
+      api.rpc('GET', 'dead-letters') as Promise<{ deadLetters: DeadLetter[]; truncated?: boolean }>,
+    ]);
+    if (!isLatest()) return;
+
+    if (tasks.status === 'fulfilled') {
+      state.tasks = tasks.value.tasks ?? [];
+      state.taskCount = tasks.value.count ?? state.tasks.length;
+      state.tasksTruncated = tasks.value.truncated === true;
       state.error = null;
-    } catch (err) {
-      state.error = (err as Error).message;
+      lastGoodLoadStartedAt = Math.max(lastGoodLoadStartedAt, startedAt);
+    } else {
+      state.error = (tasks.reason as Error).message;
     }
-    await loadHeadlessRuns();
-    await loadDeadLetters();
-    state.loading = false;
-    render(api.context);
-  }
-
-  // Runs refresh on the same cadence as the task list rather than on their own timer.
-  // There is nothing to stream: `claude -p` writes its final message on exit, so a run
-  // only ever changes once, and this surface is opened deliberately.
-  async function loadHeadlessRuns(): Promise<void> {
-    // Loaded UNFILTERED. The agent filter is applied for display in the panel, so it
-    // costs no round trip and — more importantly — runForTask() can still find a task's
-    // run while the section is filtered to a different agent. The route's ?agent=
-    // parameter still exists for direct API use.
-    try {
-      const res = await api.rpc('GET', 'headless-runs') as { runs: HeadlessRun[] };
-      state.headlessRuns = res.runs ?? [];
-    } catch {
-      // A failure here must not blank the task list — the runs section is secondary.
-      state.headlessRuns = [];
-    }
-  }
-
-  // Loaded on every refresh, not only when the section is expanded: the collapsed heading
-  // shows the count, and a count that only appears after the operator opens the section is
-  // a count nobody sees. That is the failure mode this whole surface exists to end.
-  async function loadDeadLetters(): Promise<void> {
-    try {
-      const res = await api.rpc('GET', 'dead-letters') as { deadLetters: DeadLetter[]; truncated?: boolean };
-      state.deadLetters = res.deadLetters ?? [];
-      state.deadLettersTruncated = res.truncated === true;
-    } catch {
-      // A failure here must not blank the task list — this section is secondary.
+    // Runs refresh on the same cadence as the task list rather than on their own timer.
+    // There is nothing to stream: `claude -p` writes its final message on exit, so a run
+    // only ever changes once, and this surface is opened deliberately.
+    // A failure in either secondary read must not blank the task list.
+    state.headlessRuns = runs.status === 'fulfilled' ? runs.value.runs ?? [] : [];
+    if (dead.status === 'fulfilled') {
+      state.deadLetters = dead.value.deadLetters ?? [];
+      state.deadLettersTruncated = dead.value.truncated === true;
+    } else {
       state.deadLetters = [];
       state.deadLettersTruncated = false;
     }
+    state.loading = false;
+    render(api.context);
   }
 
   async function loadRunDetail(id: string): Promise<void> {
@@ -174,9 +185,16 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     }
   }
 
+  // Same rule as listLoads, for the detail view. A detail read also loses to a change of
+  // selection: the operator has moved on, and the answer is for a task not on screen.
+  const detailLoads = new Latest();
+
   async function loadTaskDetail(taskId: string): Promise<void> {
+    const isLatest = detailLoads.begin();
+    const current = (): boolean => isLatest() && state.selectedTaskId === taskId;
     try {
       const res = await api.rpc('GET', `tasks/${taskId}`) as { task: Task; previews: Record<string, string | null> };
+      if (!current()) return;
       state.selectedTask = res.task;
       state.contextPreviews = new Map();
       if (res.previews) {
@@ -185,23 +203,56 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
         }
       }
     } catch (err) {
+      if (!current()) return;
       state.error = (err as Error).message;
     }
     render(api.context);
   }
 
-  async function handleApprove(taskId: string): Promise<void> {
+  // Task ids with a mutation or Start on the wire. A second click on the same task before
+  // the first returns is dropped, before any confirm() or prompt(). This is what keeps the
+  // plugin from ever sending a duplicate mutation: part 1's audit accepted an unpark race
+  // (F-01) on the premise that clients do not, since two concurrent unparks can both write
+  // a history entry. Reads run in parallel; mutations never do, per task.
+  const pendingActions = new Set<string>();
+
+  /**
+   * One button press: the mutation, awaited alone, then the list and (if this task is
+   * open) its detail, read in parallel. The backend invalidates its shared list before the
+   * mutation's response, so the refresh reads the new state.
+   */
+  async function mutateThenRefresh(
+    taskId: string,
+    request: () => Promise<unknown>,
+    toast: string | null,
+  ): Promise<void> {
+    if (pendingActions.has(taskId)) return;
+    pendingActions.add(taskId);
     try {
-      await api.rpc('POST', `tasks/${taskId}/approve`);
-      await loadTasks();
-      if (state.selectedTaskId === taskId) await loadTaskDetail(taskId);
+      await request();
     } catch (err) {
       state.error = (err as Error).message;
       render(api.context);
+      return;
+    } finally {
+      pendingActions.delete(taskId);
     }
+    state.error = null;
+    if (toast) showToast(toast);
+    await Promise.all([
+      loadTasks(),
+      state.selectedTaskId === taskId ? loadTaskDetail(taskId) : undefined,
+    ]);
+  }
+
+  async function handleApprove(taskId: string): Promise<void> {
+    await mutateThenRefresh(taskId, () => api.rpc('POST', `tasks/${taskId}/approve`), null);
   }
 
   async function handleStart(taskId: string, mode: 'review' | 'auto'): Promise<void> {
+    // Guarded like a mutation: a double click here would launch two sessions.
+    if (pendingActions.has(taskId)) return;
+    pendingActions.add(taskId);
     try {
       const res = await api.rpc('POST', `tasks/${taskId}/start`, { mode }) as { note?: string };
       state.error = null;
@@ -213,70 +264,56 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     } catch (err) {
       state.error = (err as Error).message;
       render(api.context);
+    } finally {
+      pendingActions.delete(taskId);
     }
   }
 
   async function handleCancel(taskId: string): Promise<void> {
+    if (pendingActions.has(taskId)) return;
     if (!confirm('Cancel this task? It becomes a terminal record — recoverable as a record, never deleted.')) return;
-    try {
-      await api.rpc('POST', `tasks/${taskId}/cancel`, { note: 'Cancelled via CloudCLI' });
-      state.error = null;
-      showToast('Task cancelled');
-      await loadTasks();
-      if (state.selectedTaskId === taskId) await loadTaskDetail(taskId);
-    } catch (err) {
-      state.error = (err as Error).message;
-      render(api.context);
-    }
+    await mutateThenRefresh(
+      taskId,
+      () => api.rpc('POST', `tasks/${taskId}/cancel`, { note: 'Cancelled via CloudCLI' }),
+      'Task cancelled',
+    );
   }
 
   async function handlePark(taskId: string): Promise<void> {
+    if (pendingActions.has(taskId)) return;
     if (!confirm("Park this task? It stays in the list, marked parked, and won't be picked up until you unpark it.")) return;
-    try {
-      await api.rpc('POST', `tasks/${taskId}/park`, { note: 'Parked via CloudCLI' });
-      state.error = null;
-      showToast('Task parked');
-      // The task stays visible — no need to leave the detail view.
-      await loadTasks();
-      if (state.selectedTaskId === taskId) await loadTaskDetail(taskId);
-    } catch (err) {
-      state.error = (err as Error).message;
-      render(api.context);
-    }
+    // The task stays visible — no need to leave the detail view.
+    await mutateThenRefresh(
+      taskId,
+      () => api.rpc('POST', `tasks/${taskId}/park`, { note: 'Parked via CloudCLI' }),
+      'Task parked',
+    );
   }
 
   async function handleUnpark(taskId: string): Promise<void> {
-    try {
-      await api.rpc('POST', `tasks/${taskId}/unpark`, { note: 'Unparked via CloudCLI' });
-      state.error = null;
-      showToast('Task unparked');
-      await loadTasks();
-      if (state.selectedTaskId === taskId) await loadTaskDetail(taskId);
-    } catch (err) {
-      state.error = (err as Error).message;
-      render(api.context);
-    }
+    await mutateThenRefresh(
+      taskId,
+      () => api.rpc('POST', `tasks/${taskId}/unpark`, { note: 'Unparked via CloudCLI' }),
+      'Task unparked',
+    );
   }
 
   async function handleAmend(taskId: string): Promise<void> {
+    if (pendingActions.has(taskId)) return;
     const amendment = prompt(
       'Append an amendment. The original description is never rewritten — this is added ' +
       'below it.\n\nIf a task needs more than one or two amendments, cancel and re-queue instead.',
     );
     if (!amendment || !amendment.trim()) return;
-    try {
-      await api.rpc('POST', `tasks/${taskId}/amend`, { amendment, reason: 'Amended via CloudCLI' });
-      state.error = null;
-      showToast('Amendment appended');
-      await loadTasks();
-      if (state.selectedTaskId === taskId) await loadTaskDetail(taskId);
-    } catch (err) {
-      state.error = (err as Error).message;
-      render(api.context);
-    }
+    await mutateThenRefresh(
+      taskId,
+      () => api.rpc('POST', `tasks/${taskId}/amend`, { amendment, reason: 'Amended via CloudCLI' }),
+      'Amendment appended',
+    );
   }
 
   async function handleRequeue(taskId: string, summary: string): Promise<void> {
+    if (pendingActions.has(taskId)) return;
     // Confirmed, because it puts work back in front of an agent. The caveat is in the
     // prompt rather than only in the docs: requeueing does not fix why the task was
     // dropped, and all seventeen of the records this shipped against would dead-letter
@@ -286,32 +323,23 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
       + 'reset. This does NOT fix why it was dropped — if the cause is still live it will '
       + 'be dead-lettered again.',
     )) return;
-    try {
-      await api.rpc('POST', `tasks/${taskId}/requeue`, { note: 'Requeued via CloudCLI' });
-      state.error = null;
-      showToast('Task requeued');
-      await loadTasks();
-    } catch (err) {
-      state.error = (err as Error).message;
-      render(api.context);
-    }
+    await mutateThenRefresh(
+      taskId,
+      () => api.rpc('POST', `tasks/${taskId}/requeue`, { note: 'Requeued via CloudCLI' }),
+      'Task requeued',
+    );
   }
 
   async function handleSetStatus(taskId: string, status: string): Promise<void> {
-    try {
-      await api.rpc('POST', `tasks/${taskId}/status`, {
+    await mutateThenRefresh(
+      taskId,
+      () => api.rpc('POST', `tasks/${taskId}/status`, {
         status,
         note: 'Status changed via CloudCLI',
         allow_override: true,
-      });
-      state.error = null;
-      showToast(`Status set to ${status}`);
-      await loadTasks();
-      if (state.selectedTaskId === taskId) await loadTaskDetail(taskId);
-    } catch (err) {
-      state.error = (err as Error).message;
-      render(api.context);
-    }
+      }),
+      `Status set to ${status}`,
+    );
   }
 
   function showToast(message: string): void {
@@ -496,7 +524,7 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
       state.wsConnected = next;
       updateConnectionBadge();
     } else if (event.type === 'tasks') {
-      debouncedRefresh();
+      debouncedRefresh(performance.now());
     }
   });
 
