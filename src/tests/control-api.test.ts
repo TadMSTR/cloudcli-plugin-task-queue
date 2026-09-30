@@ -317,3 +317,62 @@ test('an insecure base never sends the token, on reads or writes', async () => {
   assert.equal(write.status, 500);
   assert.equal(fetchSpy.calls.length, 0);
 });
+
+// ── redirects are never followed (audit F-01 / CodeRabbit CR-03) ───────
+
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+
+test('every request is sent with redirect: manual', async () => {
+  const fetchSpy = spyFetch();
+  const opts = { apiBase: 'http://127.0.0.1:8485', token: GOOD, fetchImpl: fetchSpy.impl };
+  await queueGet('/tasks', opts);
+  await callControlApi('task-abc', 'approve', {}, opts);
+  assert.equal(fetchSpy.calls.length, 2);
+  for (const { init } of fetchSpy.calls) assert.equal(init.redirect, 'manual');
+});
+
+test('a 3xx or opaque-redirect response is a 502, not a result', async () => {
+  for (const shape of [
+    { status: 302, type: 'basic' },
+    { status: 307, type: 'basic' },
+    { status: 0, type: 'opaqueredirect' },
+  ]) {
+    const impl = (async () => ({ ...shape, json: async () => ({ ok: true }) })) as unknown as typeof fetch;
+    const r = await queueGet('/tasks', { apiBase: 'http://127.0.0.1:8485', token: GOOD, fetchImpl: impl });
+    assert.equal(r.status, 502, JSON.stringify(shape));
+    assert.match((r.data as { error: string }).error, /redirect/);
+  }
+});
+
+test('a real redirect to another origin never delivers the token there', async () => {
+  // Two real servers on loopback. A answers every request with a 307 to B, and B records
+  // whether the token arrived. This exercises Node's own fetch, not a stub: the property
+  // under test is Undici's behaviour when told redirect: 'manual'.
+  let reachedB = false;
+  let tokenAtB: string | undefined;
+  const b = http.createServer((req, res) => {
+    reachedB = true;
+    tokenAtB = req.headers['x-task-queue-token'] as string | undefined;
+    res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
+  });
+  await new Promise<void>(r => b.listen(0, '127.0.0.1', () => r()));
+  const bPort = (b.address() as AddressInfo).port;
+  const a = http.createServer((req, res) => {
+    res.writeHead(307, { Location: `http://127.0.0.1:${bPort}${req.url}` }).end();
+  });
+  await new Promise<void>(r => a.listen(0, '127.0.0.1', () => r()));
+  const aPort = (a.address() as AddressInfo).port;
+  try {
+    const opts = { apiBase: `http://127.0.0.1:${aPort}`, token: GOOD };
+    const read = await queueGet('/tasks', opts);
+    const write = await callControlApi('task-abc', 'approve', {}, opts);
+    assert.equal(read.status, 502);
+    assert.equal(write.status, 502);
+    assert.equal(reachedB, false, 'the redirect target must never be contacted');
+    assert.equal(tokenAtB, undefined);
+  } finally {
+    await new Promise<void>(r => a.close(() => r()));
+    await new Promise<void>(r => b.close(() => r()));
+  }
+});
