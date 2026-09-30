@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0] - 2026-09-30
+
+Fewer, parallel reads per refresh. Programme `task-queue-read-perf-2026-09` part 3;
+vikunja#1003. **Includes 0.11.1's security fix** (redirects never followed on
+token-bearing requests), so deploying 0.12.0 supersedes the pending 0.11.1 deploy.
+No change to authentication, the token file or the manifest's grants.
+
+### Changed
+
+- **One upstream `GET /tasks` per refresh, down from two.** `/tasks` (unfiltered) and
+  `/headless-runs` used to make the same list read each. They now join one in-flight read
+  (`shared-read.ts`). Only the read is shared: nothing is served once it settles. Every
+  mutation route and a Start's history write invalidate it before responding, and so
+  does the queue watcher, so a list requested after a mutation is always read after it.
+  Filtered lists and the dead-letters read are not shared.
+- **The tab's three reads run in parallel**, and after a button press the list and the
+  task detail are re-read in parallel. A failed runs or dead-letters read still never
+  blanks the task list. Results apply last-started-wins, so a slow older refresh cannot
+  overwrite a newer one.
+- **No second refresh after a button press.** The watcher's `tasks` event for the tab's
+  own write arrives about a second later and used to trigger another full refresh. It is
+  now skipped when a refresh already started after the change it reports. Changes from
+  agents and the dispatcher still refresh live.
+- **A second click on the same task is ignored while its action is on the wire**, Start
+  included (a double click used to be able to launch two sessions). Mutations are never
+  sent in parallel or twice. task-queue-mcp's accepted unpark race (F-01) depends on this.
+
+### Measured
+
+Built backend run locally against forge's live task-queue-mcp v0.13.0, via a counting
+proxy (park stubbed at the proxy, so the queue was not written). Median of 7:
+
+| | 0.11.1 | 0.12.0 |
+|---|---|---|
+| Tab load | 0.372 s, 3 upstream reads | 0.250 s, 2 upstream reads |
+| Park + refresh | 0.382 s, 4 upstream reads | 0.268 s, 3 upstream reads |
+| Watcher refresh after that Park | 3 more reads | skipped (by rule and unit tests; seen in CloudCLI only after deploy) |
+
+The saving comes from the dropped read, not from overlap. task-queue-mcp's list parse is
+CPU-bound, so two concurrent reads take as long as two sequential ones (0.229 s vs
+0.215 s).
+
 ## [0.11.1] - 2026-09-30
 
 Security fix from the `operator-panel-2026-09-p2-queue-read-api` audit (F-01, Medium;

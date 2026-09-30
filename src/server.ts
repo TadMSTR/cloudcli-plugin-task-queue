@@ -18,6 +18,8 @@ import {
 import { loadToken, tokenPath, type TokenResult } from './queue-token.ts';
 import { evaluateUpgrade, allowedOrigins } from './ws-guard.ts';
 import { resolveAllowedPath } from './path-guard.ts';
+import { SharedRead, invalidatingWrite } from './shared-read.ts';
+import { WATCH_DEBOUNCE_MS } from './refresh-rules.ts';
 import type { DeadLetter, HeadlessRun, HeadlessRunDetail } from './types.ts';
 import { toDeadLetter } from './dead-letters.ts';
 import { isTerminal } from './vocabulary.ts';
@@ -191,6 +193,33 @@ async function listTasks(
   return page;
 }
 
+/**
+ * The unfiltered list, read once for every caller that asks while a read is in flight.
+ *
+ * `/tasks` with no filters and `/headless-runs` (through queueIndexByPrefix) both need
+ * exactly this read, and the UI requests them together. Filtered lists and the
+ * dead-letters read are different queries and are never shared. See shared-read.ts for
+ * the rules: nothing is reused once a read settles, and mutate() and the watcher
+ * invalidate it.
+ */
+const unfilteredList = new SharedRead(() => listTasks());
+
+/**
+ * Every queue mutation goes through here, never through callControlApi directly.
+ *
+ * The shared list is invalidated once the mutation returns and before the route responds,
+ * so a list the UI asks for after its click never comes from a read that started before
+ * the write, whatever the write's outcome (see invalidatingWrite).
+ * A test pins that server.ts has no other callControlApi call site.
+ */
+async function mutate(
+  taskId: string,
+  action: ControlAction,
+  body: Record<string, unknown>,
+): ReturnType<typeof callControlApi> {
+  return invalidatingWrite(unfilteredList, () => callControlApi(taskId, action, body, apiOpts()));
+}
+
 /** GET /tasks/{id}. Null when no record has the id; throws when the API fails. */
 async function getTask(taskId: string): Promise<Task | null> {
   if (!VALID_ID.test(taskId)) return null;
@@ -358,11 +387,11 @@ async function recordStartInQueue(
   // Terminal and unknown statuses are refused by the handler anyway; not asking is
   // quieter than asking and logging a rejection on every Start of a closed task.
   if (!current || isTerminal(current)) return;
-  const { status, data } = await callControlApi(taskId, 'status', {
+  const { status, data } = await mutate(taskId, 'status', {
     status: current,
     allow_override: true,
     note: `Session launched from CloudCLI in ${mode} mode`,
-  }, apiOpts());
+  });
   if (status !== 200) {
     console.error(
       `[task-queue] launched ${taskId} but could not record it in the task's history: `
@@ -550,7 +579,7 @@ async function queueIndexByPrefix(): Promise<Map<string, { status: string; taskI
   // a run it cannot match. It must not fail the whole runs list.
   let tasks: Task[] = [];
   try {
-    tasks = (await listTasks()).tasks;
+    tasks = (await unfilteredList.get()).tasks;
   } catch (err) {
     process.stderr.write(`[task-queue] headless runs: queue status unavailable: ${(err as Error).message}\n`);
   }
@@ -742,6 +771,10 @@ function startWatcher(broadcast: (msg: object) => void): void {
   // would stream a surface nobody is watching in real time.
   fs.watch(TASK_QUEUE_DIR, { persistent: false }, (_eventType, filename) => {
     if (!filename?.endsWith('.yml')) return;
+    // Invalidate on the raw event, not after the debounce: an agent's write has landed,
+    // so a read already in flight may predate it. Plugin-initiated writes are covered
+    // earlier, by mutate().
+    unfilteredList.invalidate();
     if (watchDebounce) clearTimeout(watchDebounce);
     watchDebounce = setTimeout(() => {
       watchDebounce = null;
@@ -749,7 +782,7 @@ function startWatcher(broadcast: (msg: object) => void): void {
       // It used to carry a file count, which the UI never read, and which was one more
       // reader of the queue directory with its own idea of what counts as a task.
       broadcast({ type: 'tasks', changed: filename });
-    }, 1000);
+    }, WATCH_DEBOUNCE_MS);
   });
 }
 
@@ -800,7 +833,12 @@ const server = http.createServer(async (req, res) => {
       if (status) filters.status = status;
       if (taskType) filters.task_type = taskType;
 
-      res.end(JSON.stringify(await listTasks(filters)));
+      // The UI's own list read has no filters, and shares its upstream read with the
+      // concurrent /headless-runs request. A filtered call is its own query.
+      const page = Object.keys(filters).length === 0
+        ? await unfilteredList.get()
+        : await listTasks(filters);
+      res.end(JSON.stringify(page));
       return;
     }
 
@@ -916,7 +954,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      const { status: apiStatus, data } = await callControlApi(mTaskId, action, body, apiOpts());
+      const { status: apiStatus, data } = await mutate(mTaskId, action, body);
       res.statusCode = apiStatus;
       res.end(JSON.stringify(data));
       return;
