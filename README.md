@@ -15,30 +15,33 @@ A CloudCLI tab plugin that gives [task-queue-mcp](https://github.com/TadMSTR/tas
 
 ## Architecture
 
-Four moving parts. The asymmetry is the important bit: **reads go direct to the queue files, writes always go through the MCP server.**
+Four moving parts. **Every read and every write goes through task-queue-mcp's HTTP API** (since v0.11.0, which needs task-queue-mcp v0.11.0 or later). The backend only watches the queue directory to learn *when* to re-read.
 
 ```mermaid
 flowchart LR
   UI["Plugin UI<br/>dist/index.js"] -->|api.rpc| BE["Plugin backend<br/>dist/server.js"]
-  BE -->|"read: YAML"| Q[("Task queue<br/>*.yml")]
-  BE -->|"write: POST + X-Task-Queue-Secret"| MCP["task-queue-mcp<br/>control API :8485"]
-  MCP -->|validated write| Q
-  BE -.->|"WebSocket: file-change events"| UI
+  BE -->|"GET /tasks, GET /tasks/:id<br/>X-Task-Queue-Token"| MCP["task-queue-mcp<br/>HTTP API :8485"]
+  BE -->|"POST /tasks/:id/*<br/>X-Task-Queue-Token"| MCP
+  MCP -->|validated read / write| Q[("Task queue<br/>*.yml")]
+  Q -.->|"fs.watch: change trigger"| BE
+  BE -.->|"WebSocket: tasks event"| UI
 ```
 
-Reading directly keeps the list fast and lets the backend watch the directory for live updates. Routing every write through `task-queue-mcp` means mutations inherit its transition validation, `fcntl` locking, and atomic writes, so the plugin can never leave a task in a state the queue's own rules forbid. **The plugin never writes queue YAML directly.**
+Routing writes through `task-queue-mcp` means mutations inherit its transition validation, `fcntl` locking, and atomic writes, so the plugin can never leave a task in a state the queue's own rules forbid. Routing reads through it means the plugin shows what the queue's owner says is there, with its TTL, dead-letter and status rules, instead of a second parser's opinion. Before v0.11.0 the plugin globbed the YAML itself and applied none of those rules. **The plugin never reads or writes queue YAML directly.**
 
 - **UI** (`dist/index.js`) — renders the tab panel: a filterable task list and a detail view with history timeline, amendments, and context-ref previews.
 - **Backend** (`dist/server.js`) — HTTP + WebSocket server launched by CloudCLI. Picks a free ephemeral port at startup and reports it to CloudCLI as JSON on stdout. The UI reaches it through CloudCLI's plugin RPC API (`api.rpc()`).
 
-Live updates arrive over WebSocket: the backend watches the queue directory and pushes a `tasks` event when files change; the UI debounces refreshes by 2s.
+Live updates arrive over WebSocket: the backend watches the queue directory and pushes a `tasks` event when files change; the UI debounces, then re-reads through the API.
+
+If the API truncated a read (it returns at most 1000 records per call), the header says **truncated: showing N of M** and the dead-letters badge says the count may be low. It is never hidden.
 
 ## Features
 
 - Task list with filters by agent, status, and task type, grouped by target agent
 - Detail view: full task data, history timeline, amendments, and context-ref file previews (confined to the queue and comms directories)
 - Session launch — **review mode** (plan permission; the agent presents a summary and waits) or **auto mode** (the agent claims the task and executes)
-- Lifecycle actions, all proxied through the shared-secret control API as actor `operator`:
+- Lifecycle actions, all proxied through the control API as actor `operator`. Each is recorded in the task's history with `channel: cloudcli`:
   - **Approve** a submitted or pending task
   - **Cancel** a non-terminal task — a graceful terminal record, never deleted, instead of mislabelling it `failed`
   - **Park / Unpark** — pause a task without losing sight of it. A parked task stays in the list, renders muted with an `Unpark` button, is exempt from TTL expiry, and won't be picked up until you unpark it. Unparking returns it to the status it was parked from.
@@ -175,21 +178,36 @@ pm2 restart cloudcli
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `TASK_QUEUE_API` | `http://127.0.0.1:8485` | Base URL of the task-queue-mcp HTTP control API. Configurable — the default assumes the MCP server runs loopback-local to CloudCLI. |
-| `TASK_QUEUE_API_SECRET` | — | Shared secret sent as `X-Task-Queue-Secret` on every mutation. **Required** — mutations fail closed if unset. Comes from your secret store, never from source. |
+| `TASK_QUEUE_API` | `http://127.0.0.1:8485` | Base URL of the task-queue-mcp HTTP API. Configurable — the default assumes the MCP server runs loopback-local to CloudCLI. Must be `https://`, or `http://` to a loopback host: the client token goes on every request, so anything else is refused. |
 | `CLOUDCLI_ORIGIN` | — | Additional allowed WebSocket origin, and the origin the CloudCLI host's plugin proxy sends on its upstream leg. Both sides read the same variable so they cannot disagree. `http://localhost:3001` and `http://127.0.0.1:3001` are always allowed. |
 | `AGENT_LAUNCH_POLICY` | `~/scripts/agent-launch.yml` | Path to the launch policy file (see [Session launch behaviour](#session-launch-behaviour)). |
 
+## The client token
+
+The plugin authenticates to task-queue-mcp with **its own client token**, read from a fixed file:
+
+```
+$HOME/.config/cloudcli-plugin-task-queue/token
+```
+
+- The file holds the plaintext token and nothing else (a trailing newline is ignored). It must be a regular file with mode `0600` or `0400`, in a directory you keep `0700`.
+- task-queue-mcp holds only the token's `sha256:` digest, registered with `read,operator-write` scopes as client `cloudcli`. See task-queue-mcp's README for minting a token and its digest.
+- The token is sent as `X-Task-Queue-Token`, never `Authorization`.
+
+**Fails closed.** If the file is missing, empty, not a regular file, or has any group or other permission bit, every read and write fails. The UI shows an error naming the path and the problem, and the CloudCLI process's stderr log records it once. The token itself is never logged. A missing file is re-checked on the next request, so writing it takes effect without a restart. A token that has loaded is kept until CloudCLI restarts, so a rotated token needs a restart.
+
+**Why a file and not an env var.** Before v0.11.0 the plugin used a shared secret granted through the manifest (`env:TASK_QUEUE_API_SECRET`). A manifest grant only works if the CloudCLI host process holds the variable, and **every Claude session CloudCLI launches inherits the host's environment**. So the credential for the queue's control API sat in every agent session. The host already passes `HOME` to every plugin, so a fixed path under it needs no manifest grant, no host variable, and no change to CloudCLI. The host never holds the token or its path.
+
+This is containment, not a boundary: the file is readable by the user CloudCLI runs as. What it buys is that no process's environment carries the credential, the plugin's writes are attributable (`channel: cloudcli`), and its token can be revoked on its own.
+
 ### How the plugin receives its env vars
 
-CloudCLI launches the backend as a subprocess and **strips host environment variables from it by default**, including secrets. A host var reaches the plugin only when **both** are true:
+CloudCLI launches the backend as a subprocess and **strips host environment variables from it by default**. A host var reaches the plugin only when **both** are true:
 
-1. `manifest.json` declares it — `permissions: ["env:TASK_QUEUE_API", "env:TASK_QUEUE_API_SECRET", "env:CLOUDCLI_ORIGIN"]`, and
+1. `manifest.json` declares it — `permissions: ["env:TASK_QUEUE_API", "env:CLOUDCLI_ORIGIN"]`, and
 2. the var is on CloudCLI's host-side plugin env allowlist.
 
-This needs a CloudCLI build with permission-gated env passthrough. **Without it the launcher silently strips the secret and every mutation fails closed** — the UI reports an error, but nothing about the failure names the passthrough as the cause. If mutations fail while reads work, check this first. The control-API call path logs missing-secret and unreachable-transport failures to the CloudCLI process's stderr log, and never logs the secret value.
-
-Adding a new env var means updating *both* the manifest `permissions` and the host allowlist, or it is silently refused.
+Adding a new env var means updating *both* the manifest `permissions` and the host allowlist, or it is silently refused. **Do not use this path for a credential.** Anything the host holds reaches every session it launches; use a file under `$HOME`, as the token does.
 
 ## Backend API
 
@@ -198,7 +216,7 @@ The backend exposes a small HTTP API consumed by the UI via `api.rpc()`.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Liveness check; returns `{status, uptime, version}` |
-| `GET` | `/tasks` | List tasks; query params `agent`, `status`, `type` |
+| `GET` | `/tasks` | List tasks; query params `agent`, `status`, `type`. Returns `{tasks, count, truncated}` |
 | `GET` | `/tasks/:id` | Task detail plus context-ref previews |
 | `POST` | `/tasks/:id/start` | Launch a session; body `{mode: "review"\|"auto"}`. Spawns locally, writes a run record, and records the launch in the task's history |
 | `POST` | `/tasks/:id/approve` | Approve — proxied |
@@ -208,13 +226,13 @@ The backend exposes a small HTTP API consumed by the UI via `api.rpc()`.
 | `POST` | `/tasks/:id/unpark` | Unpark; body `{note?, status?}` — proxied |
 | `POST` | `/tasks/:id/amend` | Append an amendment; body `{amendment, reason?}` — proxied |
 | `POST` | `/tasks/:id/requeue` | Requeue a dead-lettered task; body `{note?}` — proxied |
-| `GET` | `/dead-letters` | List dead-lettered tasks. Read-only |
+| `GET` | `/dead-letters` | List dead-lettered tasks; returns `{deadLetters, truncated}`. Read-only |
 | `GET` | `/headless-runs` | List headless agent runs; query param `agent`. Read-only |
 | `GET` | `/headless-runs/:id` | One run's full log text plus scraped commands; `:id` is `<agent>-<task8>`. Read-only |
 
-Reads are served directly from the queue YAML. Every proxied mutation carries the `X-Task-Queue-Secret` header and an `actor` of `operator`.
+Task, dead-letter and headless-run status reads are served from task-queue-mcp's read API. Every request to task-queue-mcp carries the plugin's `X-Task-Queue-Token`. A read the API refuses or cannot serve returns `502` with the API's error message.
 
-WebSocket upgrade is handled on the same port. Clients receive `{type: "connected", version}` on connect and `{type: "tasks", count, changed}` when task files change.
+WebSocket upgrade is handled on the same port. Clients receive `{type: "connected", version}` on connect and `{type: "tasks", changed}` when task files change.
 
 The upgrade handler gates on the **peer address** first: the server binds `127.0.0.1` on an ephemeral port, so a non-loopback peer is refused outright. An `Origin` is then checked against the allowlist **only if one is present**. A loopback peer that sends no `Origin` is accepted, because that is what CloudCLI's own plugin WS proxy looks like — the `ws` client library sends no `Origin` unless one is passed, and that leg is already authenticated by CloudCLI before the proxy is invoked. A present-but-wrong `Origin` is still refused.
 

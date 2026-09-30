@@ -1,19 +1,31 @@
-// MCP control API proxy (mutations).
+// task-queue-mcp HTTP API client: queue mutations and queue reads.
 //
-// The single validated, shared-secret-gated write path for queue mutations
-// (approve/cancel/status/park/unpark/amend/requeue). All of them proxy here so
-// they inherit the MCP core's transition validation + fcntl locking; the plugin
-// never mutates task YAML directly. Reads stay direct (see server.ts).
+// Mutations (approve/cancel/status/park/unpark/amend/requeue) proxy to the control API so
+// they inherit the MCP core's transition validation and fcntl locking; the plugin never
+// mutates task YAML. Since v0.11.0 READS go through the API too (GET /tasks,
+// GET /tasks/{id}), so the TTL, dead-letter and status rules live in one place, the queue's
+// owner, instead of being re-implemented here.
 //
-// `requeue` is the operator's path out of the dead-letter queue. It is gated on the MCP
-// side by the same shared secret as every other route here, and its MCP *tool* twin
-// refuses any agent identity outright — a plugin acting as `operator` is exactly the
-// caller it is meant for.
+// Every request carries this plugin's own client token in `X-Task-Queue-Token`. It is never
+// sent as `Authorization`: task-queue-mcp's framework authenticates bearers app-wide, and
+// the control routes deliberately read only their own header. See queue-token.ts for where
+// the token comes from and why it is not an env var.
 //
-// Extracted from server.ts so the auth/transport guards are unit-testable
-// without booting the plugin's HTTP server.
+// `requeue` is the operator's path out of the dead-letter queue. Its MCP *tool* twin
+// refuses any agent identity outright; a plugin acting as `operator` over the control API
+// is exactly the caller it is meant for.
+//
+// Extracted from server.ts so the auth/transport guards are unit-testable without booting
+// the plugin's HTTP server.
+
+import type { TokenResult } from './queue-token.ts';
 
 const VALID_ID = /^[a-zA-Z0-9_-]+$/;
+
+export const TOKEN_HEADER = 'X-Task-Queue-Token';
+
+/** The largest page task-queue-mcp's GET /tasks returns. */
+export const LIST_PAGE_MAX = 1000;
 
 export type ControlAction =
   'approve' | 'cancel' | 'status' | 'park' | 'unpark' | 'amend' | 'requeue';
@@ -24,18 +36,78 @@ export interface ControlApiResult {
 }
 
 export interface ControlApiOptions {
-  /** Base URL of the control API, no trailing slash (e.g. http://127.0.0.1:8485). */
+  /** Base URL of the API, no trailing slash (e.g. http://127.0.0.1:8485). */
   apiBase: string;
-  /** Shared secret; an empty string means the plugin never received it. */
-  secret: string;
+  /** The loaded client token, or why it could not be loaded. */
+  token: TokenResult;
   /** Injectable fetch, for tests. Defaults to the global fetch. */
   fetchImpl?: typeof fetch;
 }
 
 /**
- * Proxy a queue mutation to the MCP control API. The shared secret is sent as
- * an `X-Task-Queue-Secret` header. Returns a `{ status, data }` result — it
- * never throws; transport failures are mapped to a 502.
+ * Why `apiBase` must not carry the token, or null if it may.
+ *
+ * The token (read + operator-write) goes on every request, reads included. Over plain
+ * HTTP to another host, anything on the path could take it and act as the operator. So
+ * `http://` is accepted only for a loopback host — the default, `http://127.0.0.1:8485` —
+ * and anything else must be `https://`.
+ */
+export function insecureApiBase(apiBase: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(apiBase);
+  } catch {
+    return `TASK_QUEUE_API ${JSON.stringify(apiBase)} is not a URL`;
+  }
+  if (url.protocol === 'https:' && url.hostname) return null;
+  if (url.protocol === 'http:') {
+    // URL keeps the brackets on an IPv6 literal.
+    const host = url.hostname.toLowerCase();
+    if (host === 'localhost' || host === '[::1]' || /^127(\.\d{1,3}){3}$/.test(host)) return null;
+  }
+  return `TASK_QUEUE_API ${JSON.stringify(apiBase)} refused: the client token is only sent over https://, or over http:// to a loopback host`;
+}
+
+/**
+ * A request that never left the plugin because it has no usable token. Logged to stderr
+ * (captured into the CloudCLI process's PM2 error log) and returned as a 500 whose error
+ * names the file, so the UI says exactly what to fix.
+ */
+function noToken(what: string, error: string): ControlApiResult {
+  console.error(`[task-queue] ${what} aborted: ${error}`);
+  return { status: 500, data: { ok: false, error } };
+}
+
+async function send(
+  url: string,
+  init: RequestInit,
+  what: string,
+  opts: ControlApiOptions,
+): Promise<ControlApiResult> {
+  const doFetch = opts.fetchImpl ?? fetch;
+  try {
+    const resp = await doFetch(url, init);
+    let data: unknown = {};
+    try { data = await resp.json(); } catch { data = {}; }
+    if (resp.status === 401 || resp.status === 403) {
+      // The token loaded but the server refused it: revoked, never registered, or missing
+      // a scope. Say so in the log; the response body carries no token either way.
+      console.error(`[task-queue] ${what} refused by task-queue-mcp (${resp.status}): ${JSON.stringify(data)}`);
+    }
+    return { status: resp.status, data };
+  } catch (err) {
+    console.error(`[task-queue] ${what} unreachable at ${url}: ${(err as Error).message}`);
+    // SECURITY[accepted]: err.message (a Node fetch connection error, e.g. ECONNREFUSED —
+    // not a stack trace or internal path) is surfaced to the CloudCLI UI. Client is Ted's
+    // authenticated, loopback-bound operator UI; matches the accepted OE-02 precedent from
+    // cloudcli-plugin-plane. Genericize if this endpoint is ever exposed beyond loopback.
+    return { status: 502, data: { ok: false, error: `task-queue API unreachable: ${(err as Error).message}` } };
+  }
+}
+
+/**
+ * Proxy a queue mutation to the control API. Returns a `{ status, data }` result and never
+ * throws; transport failures are mapped to a 502.
  */
 export async function callControlApi(
   taskId: string,
@@ -46,40 +118,56 @@ export async function callControlApi(
   if (!VALID_ID.test(taskId)) {
     return { status: 400, data: { ok: false, error: 'invalid task id' } };
   }
-  if (!opts.secret) {
-    // Previously silent: the request never left the plugin, and nothing recorded
-    // that it tried. Log to stderr (captured into ~/.pm2/logs/cloudcli-error.log)
-    // so a misconfigured passthrough is diagnosable instead of a mystery 500.
-    console.error(
-      `[task-queue] control API call for ${action} on task ${taskId} aborted: ` +
-      'TASK_QUEUE_API_SECRET is empty in the plugin process. The host must grant it ' +
-      'via the manifest `permissions` (env:TASK_QUEUE_API_SECRET) and have it set in its own env.',
-    );
-    return { status: 500, data: { ok: false, error: 'TASK_QUEUE_API_SECRET not configured' } };
-  }
+  const what = `control API ${action} on task ${taskId}`;
+  const insecure = insecureApiBase(opts.apiBase);
+  if (insecure) return noToken(what, insecure);
+  if (!opts.token.ok) return noToken(what, opts.token.error);
 
-  const doFetch = opts.fetchImpl ?? fetch;
-  const url = `${opts.apiBase}/tasks/${encodeURIComponent(taskId)}/${action}`;
-  try {
-    const resp = await doFetch(url, {
+  return send(
+    `${opts.apiBase}/tasks/${encodeURIComponent(taskId)}/${action}`,
+    {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Task-Queue-Secret': opts.secret,
-      },
+      headers: { 'Content-Type': 'application/json', [TOKEN_HEADER]: opts.token.token },
+      // The server pins the actor to `operator` and ignores this field; it is sent so the
+      // request says what it is when read in isolation.
       body: JSON.stringify({ actor: 'operator', ...body }),
-    });
-    let data: unknown = {};
-    try { data = await resp.json(); } catch { data = {}; }
-    return { status: resp.status, data };
-  } catch (err) {
-    console.error(
-      `[task-queue] control API ${action} on task ${taskId} unreachable at ${url}: ${(err as Error).message}`,
-    );
-    // SECURITY[accepted]: err.message (a Node fetch connection error, e.g. ECONNREFUSED —
-    // not a stack trace or internal path) is surfaced to the CloudCLI UI. Client is Ted's
-    // authenticated, loopback-bound operator UI; matches the accepted OE-02 precedent from
-    // cloudcli-plugin-plane. Genericize if this endpoint is ever exposed beyond loopback.
-    return { status: 502, data: { ok: false, error: `control API unreachable: ${(err as Error).message}` } };
+    },
+    what,
+    opts,
+  );
+}
+
+/**
+ * GET a read route. `route` is a path relative to the API base, starting with `/`, with
+ * any query string already encoded (see tasksQuery). Never throws.
+ */
+export async function queueGet(route: string, opts: ControlApiOptions): Promise<ControlApiResult> {
+  const what = `read ${route.split('?')[0]}`;
+  const insecure = insecureApiBase(opts.apiBase);
+  if (insecure) return noToken(what, insecure);
+  if (!opts.token.ok) return noToken(what, opts.token.error);
+  return send(
+    `${opts.apiBase}${route}`,
+    { method: 'GET', headers: { [TOKEN_HEADER]: opts.token.token } },
+    what,
+    opts,
+  );
+}
+
+/** The route for GET /tasks with these filters. Empty values are dropped, not sent. */
+export function tasksQuery(params: Record<string, string | number | boolean | undefined>): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === '') continue;
+    q.set(k, String(v));
   }
+  const s = q.toString();
+  return s ? `/tasks?${s}` : '/tasks';
+}
+
+/** A one-line description of a failed API result, for the UI. Never includes a token. */
+export function apiErrorMessage(result: ControlApiResult): string {
+  const data = result.data as { error?: unknown } | null;
+  const detail = typeof data?.error === 'string' ? data.error : 'no detail';
+  return `task-queue API ${result.status}: ${detail}`;
 }

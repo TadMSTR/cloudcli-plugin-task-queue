@@ -35,6 +35,7 @@
  */
 
 import fs from 'node:fs';
+import { isTerminal } from './vocabulary.ts';
 import path from 'node:path';
 
 /** Where each agent's server-side environment file lives. */
@@ -180,4 +181,22 @@ export function preLaunchEnv(
   }
 
   return { ok: true, env };
+}
+
+/**
+ * Why a Start must not launch a session for this task, or null if it may.
+ *
+ * The task lookup goes through task-queue-mcp's `GET /tasks/{id}`, which also resolves
+ * archived and dead-lettered records. Before v0.11.0 the plugin scanned only the live
+ * queue directory, so Start could never reach them. Viewing them is useful; launching an
+ * agent at one is not. A dead letter's route is to Requeue, and a finished task has
+ * nothing left to do. The agent would be refused when it tried to claim, but by then a
+ * session has already been spawned.
+ */
+export function launchRefusal(task: { queue_location?: unknown; status?: unknown }): string | null {
+  const location = typeof task.queue_location === 'string' ? task.queue_location : 'queue';
+  if (location !== 'queue') return `task is in ${location}, not the live queue`;
+  const status = typeof task.status === 'string' ? task.status : '';
+  if (isTerminal(status)) return `task is ${status}`;
+  return null;
 }

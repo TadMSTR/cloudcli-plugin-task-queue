@@ -5,14 +5,23 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import { load as yamlLoad } from 'js-yaml';
-import { callControlApi, type ControlAction } from './control-api.ts';
+import {
+  callControlApi,
+  queueGet,
+  tasksQuery,
+  apiErrorMessage,
+  insecureApiBase,
+  LIST_PAGE_MAX,
+  type ControlAction,
+  type ControlApiOptions,
+} from './control-api.ts';
+import { loadToken, tokenPath, type TokenResult } from './queue-token.ts';
 import { evaluateUpgrade, allowedOrigins } from './ws-guard.ts';
 import { resolveAllowedPath } from './path-guard.ts';
 import type { DeadLetter, HeadlessRun, HeadlessRunDetail } from './types.ts';
 import { toDeadLetter } from './dead-letters.ts';
 import { isTerminal } from './vocabulary.ts';
-import { preLaunchEnv } from './launch-guards.ts';
+import { preLaunchEnv, launchRefusal } from './launch-guards.ts';
 import {
   loadRunRecord,
   outcomeLabel,
@@ -47,11 +56,9 @@ import {
 // ── Constants ──────────────────────────────────────────────────────────
 
 const HOME = process.env.HOME ?? os.homedir();
+// Watched as a change trigger only (see startWatcher). Nothing in this file parses the
+// queue's YAML any more; every read goes through task-queue-mcp's read API.
 const TASK_QUEUE_DIR = path.join(HOME, '.claude', 'task-queue');
-// Written by task-dispatcher when a task exhausts its routing retries. Read-only here;
-// the one mutation that touches it (requeue) goes through the MCP control API like every
-// other mutation. See listDeadLetters.
-const DEAD_LETTER_DIR = path.join(TASK_QUEUE_DIR, 'dead-letters');
 const START_TIME = Date.now();
 
 // Read from package.json rather than hardcoding. A hardcoded copy silently drifted
@@ -69,11 +76,42 @@ const VERSION: string = (() => {
 
 const VALID_ID = /^[a-zA-Z0-9_-]+$/;
 
-// MCP control API — the single validated, shared-secret-gated mutation path. All
-// queue mutations (approve/cancel/status/park/unpark/amend/requeue) proxy here so
-// they inherit the MCP core's transition validation + fcntl locking. Reads stay direct.
+// task-queue-mcp's HTTP API — the single validated path for every queue read and write.
+// Mutations inherit the MCP core's transition validation and fcntl locking; reads inherit
+// its TTL, dead-letter and status rules. See control-api.ts.
 const TASK_QUEUE_API = (process.env.TASK_QUEUE_API ?? 'http://127.0.0.1:8485').replace(/\/$/, '');
-const TASK_QUEUE_API_SECRET = process.env.TASK_QUEUE_API_SECRET ?? '';
+
+// This plugin's own client token, from a fixed file under HOME — never from the env, and
+// the path is not configurable through the env either. See queue-token.ts for why.
+//
+// Loaded at startup and cached once it loads. A failed load is retried on the next
+// request, so writing the file (or fixing its mode) takes effect without a CloudCLI
+// restart; a token that has loaded is kept until the plugin restarts, which is what
+// rotation needs anyway.
+const TOKEN_FILE = tokenPath(HOME);
+let tokenState: TokenResult | null = null;
+
+function queueToken(): TokenResult {
+  if (tokenState?.ok) return tokenState;
+  const next = loadToken(TOKEN_FILE);
+  // Log a failure once per distinct reason rather than on every request.
+  if (!next.ok && (!tokenState || tokenState.ok || tokenState.error !== next.error)) {
+    process.stderr.write(`[task-queue] ${next.error} — every queue read and write will fail\n`);
+  }
+  tokenState = next;
+  return next;
+}
+
+function apiOpts(): ControlApiOptions {
+  return { apiBase: TASK_QUEUE_API, token: queueToken() };
+}
+
+/** A read the API refused or could not serve. Carries the status to return to the UI. */
+class QueueReadError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
 
 // Agent launch policy — ONE roster, shared with task-dispatcher.py. See
 // launch-policy.ts. The hardcoded AGENT_PROJECTS map that used to live here was a
@@ -99,10 +137,10 @@ const LAUNCH_POLICY: { policy: LaunchPolicy | null; error: string | null } = (()
   }
 })();
 
-// ── Task operations (direct YAML file reader) ─────────────────────────
+// ── Task reads (task-queue-mcp read API) ──────────────────────────────
 
-// Deliberately looser than the `Task` in types.ts: this parses arbitrary YAML off disk,
-// so every field is optional and unknown keys pass through to the client untouched. The UI
+// Deliberately looser than the `Task` in types.ts: this is whatever the API returned, so
+// every field is optional and unknown keys pass through to the client untouched. The UI
 // side gets the strict shape. Only the fields this file actually reads are named.
 interface Task {
   id?: string;
@@ -111,95 +149,83 @@ interface Task {
   status?: string;
   summary?: string;
   created?: unknown;
+  queue_location?: string;
   /** Passed to the launcher on Start so a `manual-then-auto` task keeps its chain. */
   workflow_mode?: string;
   payload?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
-// Files are named TIMESTAMP-<id_prefix>.yml; scan by id field value.
-function findTaskFilePath(taskId: string): string | null {
+interface TaskPage {
+  tasks: Task[];
+  /** How many records matched, which may exceed tasks.length. */
+  count: number;
+  /** True when the API's page limit cut records off. Rendered, never hidden. */
+  truncated: boolean;
+}
+
+/**
+ * One page of tasks from GET /tasks, at the API's page ceiling.
+ *
+ * The API applies the queue's own rules: open work is listed however old it is, finished
+ * work ages out at its ttl_days, and dead letters are excluded unless asked for. Before
+ * v0.11.0 this function globbed the queue directory and applied none of them.
+ */
+async function listTasks(
+  filters: { target_agent?: string; status?: string; task_type?: string; include_dead_letters?: boolean } = {},
+): Promise<TaskPage> {
+  const result = await queueGet(tasksQuery({ ...filters, limit: LIST_PAGE_MAX }), apiOpts());
+  if (result.status !== 200) throw new QueueReadError(502, apiErrorMessage(result));
+  const data = result.data as Partial<TaskPage>;
+  const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+  const page = {
+    tasks,
+    count: typeof data.count === 'number' ? data.count : tasks.length,
+    truncated: data.truncated === true,
+  };
+  if (page.truncated) {
+    process.stderr.write(
+      `[task-queue] task list truncated: ${page.tasks.length} of ${page.count} matching records returned\n`,
+    );
+  }
+  return page;
+}
+
+/** GET /tasks/{id}. Null when no record has the id; throws when the API fails. */
+async function getTask(taskId: string): Promise<Task | null> {
   if (!VALID_ID.test(taskId)) return null;
-  try {
-    if (!fs.existsSync(TASK_QUEUE_DIR)) return null;
-    const files = fs.readdirSync(TASK_QUEUE_DIR).filter(f => f.endsWith('.yml') && !f.endsWith('.tmp'));
-    for (const file of files) {
-      try {
-        const f = path.join(TASK_QUEUE_DIR, file);
-        const content = fs.readFileSync(f, 'utf-8');
-        const task = yamlLoad(content) as Task;
-        if (task?.id === taskId) return f;
-      } catch { /* skip */ }
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function listTasks(filters: { target_agent?: string; status?: string; task_type?: string } = {}): Task[] {
-  try {
-    if (!fs.existsSync(TASK_QUEUE_DIR)) return [];
-    const files = fs.readdirSync(TASK_QUEUE_DIR).filter(f => f.endsWith('.yml') && !f.endsWith('.tmp'));
-    const tasks: Task[] = [];
-    for (const file of files) {
-      try {
-        const content = fs.readFileSync(path.join(TASK_QUEUE_DIR, file), 'utf-8');
-        const task = yamlLoad(content) as Task;
-        if (!task?.id) continue;
-        if (filters.target_agent && task.target_agent !== filters.target_agent) continue;
-        if (filters.status && task.status !== filters.status) continue;
-        if (filters.task_type && task.task_type !== filters.task_type) continue;
-        tasks.push(task);
-      } catch { /* skip corrupt file */ }
-    }
-    return tasks;
-  } catch {
-    return [];
-  }
-}
-
-function getTask(taskId: string): Task | null {
-  const f = findTaskFilePath(taskId);
-  if (!f) return null;
-  try {
-    return yamlLoad(fs.readFileSync(f, 'utf-8')) as Task;
-  } catch {
-    return null;
-  }
+  const result = await queueGet(`/tasks/${encodeURIComponent(taskId)}`, apiOpts());
+  // Only a 404 means "no such task". The id was validated above, so a 400 from the API is
+  // a disagreement worth seeing, and is surfaced like any other API failure rather than
+  // rendered as "task not found".
+  if (result.status === 404) return null;
+  if (result.status !== 200) throw new QueueReadError(502, apiErrorMessage(result));
+  return ((result.data as { task?: Task }).task) ?? null;
 }
 
 // ── Dead letters (read-only) ──────────────────────────────────────────
 
 /**
- * Every record in dead-letters/, shaped for the UI.
+ * Every dead-lettered record, shaped for the UI, plus whether the read was truncated.
  *
- * A missing directory is an empty list, not an error — the healthy state of this queue is
- * zero, and a plugin that errored when nothing had failed would be broken most of the time.
+ * Read through the API with include_dead_letters. Every dead letter carries status
+ * `failed`, so the query filters on it to keep the page small, and the API sorts dead
+ * letters first so a page limit cuts live `failed` records before it cuts a dead letter.
+ * Records are then kept by `queue_location`, never by status: a `failed` task in the live
+ * queue is not a dead letter and has no Requeue.
+ *
  * Records with no `id` are skipped rather than rendered: a row we cannot address is a row
  * whose Requeue button could not work, and offering one would be a lie.
- *
- * This reads YAML directly, like every other read in this file. The single mutation on
- * these records — requeue — still goes through the control API.
  */
-function listDeadLetters(): DeadLetter[] {
-  let names: string[];
-  try {
-    names = fs.readdirSync(DEAD_LETTER_DIR);
-  } catch {
-    return [];
+async function listDeadLetters(): Promise<{ deadLetters: DeadLetter[]; truncated: boolean }> {
+  const page = await listTasks({ status: 'failed', include_dead_letters: true });
+  const deadLetters: DeadLetter[] = [];
+  for (const t of page.tasks) {
+    if (t.queue_location !== 'dead-letters') continue;
+    const dl = toDeadLetter(t as Record<string, unknown>);
+    if (dl) deadLetters.push(dl);
   }
-
-  const letters: DeadLetter[] = [];
-  for (const name of names) {
-    if (!name.endsWith('.yml') || name.endsWith('.tmp')) continue;
-    try {
-      const raw = yamlLoad(fs.readFileSync(path.join(DEAD_LETTER_DIR, name), 'utf-8'));
-      const dl = toDeadLetter((raw ?? {}) as Record<string, unknown>);
-      if (dl) letters.push(dl);
-    } catch { /* skip corrupt file */ }
-  }
-  return letters;
+  return { deadLetters, truncated: page.truncated };
 }
 
 // ── Context ref preview ───────────────────────────────────────────────
@@ -336,7 +362,7 @@ async function recordStartInQueue(
     status: current,
     allow_override: true,
     note: `Session launched from CloudCLI in ${mode} mode`,
-  }, { apiBase: TASK_QUEUE_API, secret: TASK_QUEUE_API_SECRET });
+  }, apiOpts());
   if (status !== 200) {
     console.error(
       `[task-queue] launched ${taskId} but could not record it in the task's history: `
@@ -517,10 +543,18 @@ const HEADLESS_MAX_BYTES = 512 * 1024;
  *
  * A prefix collision resolves to `unknown` rather than to an arbitrary one of the two.
  */
-function queueIndexByPrefix(): Map<string, { status: string; taskId: string }> {
+async function queueIndexByPrefix(): Promise<Map<string, { status: string; taskId: string }>> {
   const idx = new Map<string, { status: string; taskId: string }>();
   const collided = new Set<string>();
-  for (const t of listTasks()) {
+  // A failed read leaves every run's status `unknown`, which is what the view renders for
+  // a run it cannot match. It must not fail the whole runs list.
+  let tasks: Task[] = [];
+  try {
+    tasks = (await listTasks()).tasks;
+  } catch (err) {
+    process.stderr.write(`[task-queue] headless runs: queue status unavailable: ${(err as Error).message}\n`);
+  }
+  for (const t of tasks) {
     const id = typeof t.id === 'string' ? t.id : '';
     if (!id) continue;
     const key = id.slice(0, 8);
@@ -583,8 +617,8 @@ function launchStems(): Map<string, { agent: string; taskId8: string }> {
   return stems;
 }
 
-function listHeadlessRuns(agentFilter?: string): HeadlessRun[] {
-  const queue = queueIndexByPrefix();
+async function listHeadlessRuns(agentFilter?: string): Promise<HeadlessRun[]> {
+  const queue = await queueIndexByPrefix();
   const runs: HeadlessRun[] = [];
 
   for (const parsed of launchStems().values()) {
@@ -627,7 +661,7 @@ function listHeadlessRuns(agentFilter?: string): HeadlessRun[] {
   return runs;
 }
 
-function readHeadlessRun(id: string): HeadlessRunDetail | null {
+async function readHeadlessRun(id: string): Promise<HeadlessRunDetail | null> {
   // `id` is validated as <agent>-<task8> and the filename is then REBUILT via
   // launchLogName, so the caller's string never reaches the filesystem as a path even
   // before the realpath guard runs. Two independent barriers, deliberately.
@@ -671,7 +705,7 @@ function readHeadlessRun(id: string): HeadlessRunDetail | null {
   // reader of all of them.
   if (!logReadable && !record) return null;
 
-  const match = queueIndexByPrefix().get(parsed.taskId8);
+  const match = (await queueIndexByPrefix()).get(parsed.taskId8);
   return {
     id: runId(parsed.agent, parsed.taskId8),
     agent: parsed.agent,
@@ -711,11 +745,10 @@ function startWatcher(broadcast: (msg: object) => void): void {
     if (watchDebounce) clearTimeout(watchDebounce);
     watchDebounce = setTimeout(() => {
       watchDebounce = null;
-      // Count current tasks
-      try {
-        const files = fs.readdirSync(TASK_QUEUE_DIR).filter(f => f.endsWith('.yml') && !f.endsWith('.tmp'));
-        broadcast({ type: 'tasks', count: files.length, changed: filename });
-      } catch { /* skip */ }
+      // A change trigger and nothing more: the UI re-reads through the API on this event.
+      // It used to carry a file count, which the UI never read, and which was one more
+      // reader of the queue directory with its own idea of what counts as a task.
+      broadcast({ type: 'tasks', changed: filename });
     }, 1000);
   });
 }
@@ -767,15 +800,14 @@ const server = http.createServer(async (req, res) => {
       if (status) filters.status = status;
       if (taskType) filters.task_type = taskType;
 
-      const tasks = listTasks(filters);
-      res.end(JSON.stringify({ tasks }));
+      res.end(JSON.stringify(await listTasks(filters)));
       return;
     }
 
     // Get task detail
     const taskMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)$/);
     if (taskMatch && req.method === 'GET') {
-      const task = getTask(taskMatch[1]);
+      const task = await getTask(taskMatch[1]);
       if (!task) { res.statusCode = 404; res.end(JSON.stringify({ error: 'not found' })); return; }
       // Get context ref previews
       const previews: Record<string, string | null> = {};
@@ -790,14 +822,14 @@ const server = http.createServer(async (req, res) => {
 
     // List dead letters. Read-only; grouping happens in the panel via groupByReason.
     if (pathname === '/dead-letters' && req.method === 'GET') {
-      res.end(JSON.stringify({ deadLetters: listDeadLetters() }));
+      res.end(JSON.stringify(await listDeadLetters()));
       return;
     }
 
     // List headless runs. Read-only.
     if (pathname === '/headless-runs' && req.method === 'GET') {
       const agent = url.searchParams.get('agent');
-      res.end(JSON.stringify({ runs: listHeadlessRuns(agent ?? undefined) }));
+      res.end(JSON.stringify({ runs: await listHeadlessRuns(agent ?? undefined) }));
       return;
     }
 
@@ -805,7 +837,7 @@ const server = http.createServer(async (req, res) => {
     // character class as /tasks/:id and is never treated as a path — see readHeadlessRun.
     const runMatch = pathname.match(/^\/headless-runs\/([a-zA-Z0-9_-]+)$/);
     if (runMatch && req.method === 'GET') {
-      const run = readHeadlessRun(runMatch[1]);
+      const run = await readHeadlessRun(runMatch[1]);
       if (!run) { res.statusCode = 404; res.end(JSON.stringify({ error: 'not found' })); return; }
       res.end(JSON.stringify(run));
       return;
@@ -834,8 +866,14 @@ const server = http.createServer(async (req, res) => {
         }));
         return;
       }
-      const taskData = getTask(startMatch[1]);
+      const taskData = await getTask(startMatch[1]);
       if (!taskData) { res.statusCode = 404; res.end(JSON.stringify({ error: 'task not found' })); return; }
+      const refusal = launchRefusal(taskData);
+      if (refusal) {
+        res.statusCode = 409;
+        res.end(JSON.stringify({ ok: false, error: `not launching: ${refusal}` }));
+        return;
+      }
       const result = launchSession(
         startMatch[1],
         taskData.target_agent ?? '',
@@ -848,8 +886,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Queue mutations — all proxied to the MCP control API (the single validated,
-    // shared-secret-gated write path). No direct YAML mutation happens in the plugin.
+    // Queue mutations — all proxied to the MCP control API (the single validated write
+    // path, under this plugin's own token). No direct YAML mutation happens in the plugin.
     const mutationMatch = pathname.match(/^\/tasks\/([a-zA-Z0-9_-]+)\/(approve|cancel|status|park|unpark|amend|requeue)$/);
     if (mutationMatch && req.method === 'POST') {
       const mTaskId = mutationMatch[1];
@@ -878,10 +916,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      const { status: apiStatus, data } = await callControlApi(mTaskId, action, body, {
-        apiBase: TASK_QUEUE_API,
-        secret: TASK_QUEUE_API_SECRET,
-      });
+      const { status: apiStatus, data } = await callControlApi(mTaskId, action, body, apiOpts());
       res.statusCode = apiStatus;
       res.end(JSON.stringify(data));
       return;
@@ -892,6 +927,13 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: 'not found' }));
 
   } catch (err) {
+    if (err instanceof QueueReadError) {
+      // The API's own message (it names a missing token file, a refused token or an
+      // unreachable server) is what the operator needs to see. It never carries a token.
+      res.statusCode = err.status;
+      res.end(JSON.stringify({ error: err.message }));
+      return;
+    }
     process.stderr.write(`[task-queue] ${(err as Error).message}\n`);
     res.statusCode = 500;
     res.end(JSON.stringify({ error: 'internal server error' }));
@@ -945,5 +987,10 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(0, '127.0.0.1', () => {
   const addr = server.address() as { port: number };
   console.log(JSON.stringify({ ready: true, port: addr.port }));
+  // Report a refused TASK_QUEUE_API at boot too; every request would fail on it anyway.
+  const insecure = insecureApiBase(TASK_QUEUE_API);
+  if (insecure) process.stderr.write(`[task-queue] ${insecure} — every queue read and write will fail\n`);
+  // Load (and, if broken, report) the token at boot rather than on the first click.
+  if (queueToken().ok) process.stderr.write(`[task-queue] client token loaded from ${TOKEN_FILE}\n`);
   startWatcher(broadcast);
 });

@@ -2,6 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2026-09-29
+
+Own client token, and every read through task-queue-mcp's API. Build
+`operator-panel-2026-09-p2-queue-read-api`; vikunja#396. **Requires task-queue-mcp
+v0.11.0 or later** and a token file (below).
+
+### Changed
+
+- **The plugin authenticates with its own client token**, read from
+  `$HOME/.config/cloudcli-plugin-task-queue/token` and sent as `X-Task-Queue-Token`.
+  `manifest.json` no longer requests `env:TASK_QUEUE_API_SECRET`, and no replacement
+  grant was added. A manifest grant only works if the CloudCLI host holds the value, and
+  every Claude session CloudCLI launches inherits the host's environment, so the old
+  shared secret sat in every agent session. The host now holds neither the token nor its
+  path. Writes are recorded with `channel: cloudcli`.
+- **Fails closed** when the token file is missing, empty, not a regular file, or has any
+  group or other permission bit. The UI error names the path and the problem; the token
+  is never logged. A missing file is re-checked on the next request.
+- **Every queue read goes through the API** (`GET /tasks`, `GET /tasks/{id}`). That covers
+  the task list, the task detail, the Start route's task lookup, the dead-letters section
+  and the headless-run status index. The backend no longer parses queue YAML at all. The
+  list now follows the queue owner's rules: finished tasks past their `ttl_days` age out,
+  as they do for every agent's `list_tasks`, where this plugin previously showed every
+  file in the directory. Task detail now also resolves archived and dead-lettered ids.
+- **Truncation is shown.** The API returns at most 1000 records per read. When it cuts
+  records off, the header reads `truncated: showing N of M`, and the dead-letters badge
+  says the count may be low.
+- **Start launches only live, unfinished work.** Task lookup now also resolves archived and
+  dead-lettered records, which the old directory scan never saw. `POST /tasks/:id/start`
+  refuses any task outside the live queue or in a terminal status with a 409 and the reason
+  (`launchRefusal` in `launch-guards.ts`), so the launch surface is no wider than before.
+- **`TASK_QUEUE_API` must be `https://`, or `http://` to a loopback host.** The token goes
+  on every read and write, so the plugin refuses to send it in cleartext to another host
+  (each request fails with an error naming the variable). The default passes.
+- The `tasks` WebSocket event no longer carries a file `count`, which the UI never read.
+  The queue watcher is now a change trigger only.
+
+### Removed
+
+- `TASK_QUEUE_API_SECRET` and the `X-Task-Queue-Secret` header.
+
+### Security
+
+- **js-yaml 4.3.1 → 4.3.2** (GHSA-2883-xcg3-v3hh, high: merge keys with empty sources
+  are not bounded by `maxTotalMergeKeys`). The plugin parses one YAML file, the
+  operator-owned launch policy, so exposure was low; the production-dependency audit gate
+  failed on it.
+
 ## [0.10.0] - 2026-08-29
 
 Tracker: vikunja#560. Build plan: agent-workflow-interop-2026-08, Phase 5.5 and 5.6.

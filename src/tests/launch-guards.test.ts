@@ -239,3 +239,26 @@ test('an expired OAuth blocks a direct launch even with a bearer token', () => {
 
   assert.equal(preLaunchEnv('developer', null, {}, { envRoot: root, oauthPath: f }).ok, false);
 });
+
+// ── launchRefusal: Start launches only live, unfinished work ──────────
+
+import { launchRefusal } from '../launch-guards.ts';
+
+test('Start refuses archived and dead-lettered records', () => {
+  assert.match(launchRefusal({ queue_location: 'archive', status: 'approved' }) ?? '', /archive/);
+  assert.match(launchRefusal({ queue_location: 'dead-letters', status: 'failed' }) ?? '', /dead-letters/);
+});
+
+test('Start refuses a terminal task in the live queue', () => {
+  for (const status of ['completed', 'failed', 'cancelled']) {
+    assert.match(launchRefusal({ queue_location: 'queue', status }) ?? '', new RegExp(status));
+  }
+});
+
+test('Start allows live, unfinished work', () => {
+  for (const status of ['submitted', 'approved', 'in-progress', 'parked', 'routing-failed']) {
+    assert.equal(launchRefusal({ queue_location: 'queue', status }), null, status);
+  }
+  // A record with no location predates queue_location and was read from the live queue.
+  assert.equal(launchRefusal({ status: 'approved' }), null);
+});
