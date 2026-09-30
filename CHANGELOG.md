@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.1] - 2026-09-30
+
+Security fix from the `operator-panel-2026-09-p2-queue-read-api` audit (F-01, Medium;
+CodeRabbit CR-03 on #13).
+
+### Security
+
+- **Redirects are never followed on token-bearing requests.** `fetch` follows redirects by
+  default, and Undici keeps custom headers across the hop, so a redirect from the configured
+  `TASK_QUEUE_API` would have delivered `X-Task-Queue-Token` (read + operator-write) to
+  whatever origin the `Location` named. `insecureApiBase()` only vets the configured base.
+  Every request now goes out with `redirect: 'manual'`, and any 3xx or opaque-redirect
+  response is refused as a 502 without reading its body. task-queue-mcp never redirects,
+  so there is no behaviour change on forge. A test with two real loopback servers confirms
+  the redirect target is never contacted, and fails against v0.11.0.
+
 ## [0.11.0] - 2026-09-29
 
 Own client token, and every read through task-queue-mcp's API. Build

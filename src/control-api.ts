@@ -86,7 +86,21 @@ async function send(
 ): Promise<ControlApiResult> {
   const doFetch = opts.fetchImpl ?? fetch;
   try {
-    const resp = await doFetch(url, init);
+    // Never follow a redirect. fetch's default is to follow, and Undici keeps custom
+    // request headers across the hop, X-Task-Queue-Token included. So a redirect from the
+    // configured base would hand this read+operator-write token to whatever origin the
+    // Location names. insecureApiBase() only vets the configured base, not where a
+    // response points next. task-queue-mcp never redirects, so any 3xx is a fault and is
+    // reported as one. (Audit 2026-09-30/operator-panel-2026-09-p2-queue-read-api F-01,
+    // CodeRabbit CR-03 on #13.)
+    const resp = await doFetch(url, { ...init, redirect: 'manual' });
+    // The spec returns an opaque-redirect response (type 'opaqueredirect', status 0) for a
+    // manual redirect; Node's Undici returns the 3xx itself. Refuse both, and do not read
+    // the body: nothing in a redirect response is ours to act on.
+    if (resp.type === 'opaqueredirect' || (resp.status >= 300 && resp.status < 400)) {
+      console.error(`[task-queue] ${what} refused: task-queue-mcp answered with a redirect (${resp.status}); not following it`);
+      return { status: 502, data: { ok: false, error: `task-queue API answered with a redirect (${resp.status}); refused` } };
+    }
     let data: unknown = {};
     try { data = await resp.json(); } catch { data = {}; }
     if (resp.status === 401 || resp.status === 403) {
