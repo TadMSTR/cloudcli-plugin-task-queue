@@ -61,6 +61,7 @@ export const VALID_TASK_TYPES = [
   'docs',
   'ticket_audit',
   'ticket_audit_complete',
+  'pre_audit',
 ] as const;
 
 export const VALID_WORKFLOW_MODES = ['semi-auto', 'auto', 'manual-then-auto'] as const;

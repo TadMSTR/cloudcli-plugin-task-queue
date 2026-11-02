@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0] - 2026-11-02
+
+Programme `audit-fixer-2026-11` part 2, Phase 5. #1365 (id 1448).
+
+### Added
+
+- **`pre_audit` in the task-type vocabulary**, matching task-queue-mcp v0.16.0. A
+  `pre_audit` task is a build's fixer task: the build agent queues it to itself and
+  task-dispatcher v1.6.0 launches the fixer session. The type appears in the list's type
+  filter like any other. The Start button on one is a manual start: it sends the generic
+  prompt, and `shared-build-fixer` accepts that as an attended run. The plugin has no
+  fixer launcher of its own and gets none here.
+
 ## [0.12.0] - 2026-09-30
 
 Fewer, parallel reads per refresh. Programme `task-queue-read-perf-2026-09` part 3;
